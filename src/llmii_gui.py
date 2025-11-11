@@ -4,6 +4,8 @@ import json
 import shutil
 import base64
 import requests
+import uuid
+import exiftool
 
 from PyQt6.QtCore import QThread, pyqtSignal, QObject, Qt, QSize
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -601,6 +603,253 @@ class APICheckThread(QThread):
     def stop(self):
         self.running = False
         
+class RegenerationHelper:
+    """Lightweight helper for regenerating metadata for a single image"""
+    def __init__(self, config):
+        self.config = config
+        self.llm_processor = llmii.LLMProcessor(config)
+        self.et = exiftool.ExifToolHelper(encoding='utf-8')
+        
+        # Banned words for keyword processing (same as FileProcessor)
+        self.banned_words = ["no", "unspecified", "unknown", "unidentified", "identify", "topiary", 
+                            "themes concepts", "items animals", "animals objects", "structures landmarks", 
+                            "Foreground and background", "notable colors", "textures styles", 
+                            "actions activities", "physical appearance", "Gender", "Age range", 
+                            "visibly apparent", "apparent ancestry", "Occupation/role", 
+                            "Relationships between individuals", "Emotions expressions", "body language"]
+    
+    def read_metadata(self, file_path):
+        """Read current metadata from file"""
+        try:
+            # Check for sidecar file
+            if self.config.use_sidecar and os.path.exists(file_path + ".xmp"):
+                file_path = file_path + ".xmp"
+            
+            # Read metadata using same fields as FileProcessor
+            exiftool_fields = [
+                "SourceFile", "MWG:Keywords", "MWG:Description", "XMP:Identifier", "XMP:Status"
+            ]
+            
+            result = self.et.get_tags([file_path], tags=exiftool_fields)
+            if result and len(result) > 0:
+                return result[0]
+            return {}
+        except Exception as e:
+            print(f"Error reading metadata: {e}")
+            return {}
+    
+    def process_keywords(self, metadata, new_keywords):
+        """Normalize extracted keywords and deduplicate them (same as FileProcessor)"""
+        from src.llmii import normalize_keyword
+        
+        all_keywords = set()
+        
+        if self.config.update_keywords:
+            existing_keywords = metadata.get("MWG:Keywords", [])
+            
+            if isinstance(existing_keywords, str):
+                existing_keywords = existing_keywords.split(",")
+            
+            for keyword in existing_keywords:
+                normalized = normalize_keyword(keyword, self.banned_words, self.config)
+                if normalized:
+                    all_keywords.add(normalized)
+        
+        for keyword in new_keywords:
+            normalized = normalize_keyword(keyword, self.banned_words, self.config)
+            if normalized:
+                all_keywords.add(normalized)
+        
+        if all_keywords:
+            return list(all_keywords)
+        else:
+            return []
+    
+    def generate_metadata(self, metadata, processed_image):
+        """Generate new metadata (reusing logic from FileProcessor.generate_metadata)"""
+        from src.llmii import clean_json, clean_string
+        
+        new_metadata = {}
+        existing_caption = metadata.get("MWG:Description")
+        caption = None
+        keywords = None
+        detailed_caption = ""
+        old_keywords = metadata.get("MWG:Keywords", [])
+        file_path = metadata["SourceFile"]
+        
+        try:
+            # Determine what to generate based on generation_mode
+            generation_mode = getattr(self.config, 'generation_mode', 'both')
+            
+            if generation_mode == "description_only":
+                detailed_caption = clean_string(self.llm_processor.describe_content(task="caption", processed_image=processed_image))
+                if existing_caption and self.config.update_caption:
+                    caption = existing_caption + "<generated>" + detailed_caption + "</generated>"
+                else:
+                    caption = detailed_caption
+                keywords = []
+                status = "success" if caption else "retry"
+                
+            elif generation_mode == "keywords_only":
+                data = clean_json(self.llm_processor.describe_content(task="keywords_only", processed_image=processed_image))
+                if isinstance(data, dict):
+                    keywords = data.get("Keywords")
+                else:
+                    keywords = None
+                caption = existing_caption
+                if not keywords:
+                    status = "retry"
+                else:
+                    status = "success"
+                    keywords = self.process_keywords(metadata, keywords)
+                    
+            else:  # generation_mode == "both"
+                if not self.config.no_caption and self.config.detailed_caption:
+                    data = clean_json(self.llm_processor.describe_content(task="keywords_only", processed_image=processed_image))
+                    detailed_caption = clean_string(self.llm_processor.describe_content(task="caption", processed_image=processed_image))
+                    if existing_caption and self.config.update_caption:
+                        caption = existing_caption + "<generated>" + detailed_caption + "</generated>"
+                    else:
+                        caption = detailed_caption
+                    if isinstance(data, dict):
+                        keywords = data.get("Keywords")
+                else:
+                    data = clean_json(self.llm_processor.describe_content(task="caption_and_keywords", processed_image=processed_image))
+                    if isinstance(data, dict):
+                        keywords = data.get("Keywords")
+                        if not existing_caption and not self.config.no_caption:
+                            caption = data.get("Description")
+                        elif existing_caption and self.config.update_caption:
+                            caption = existing_caption + "<generated>" + data.get("Description", "") + "</generated>"
+                        else:
+                            caption = data.get("Description")
+                
+                if keywords:
+                    keywords = self.process_keywords(metadata, keywords)
+                else:
+                    keywords = []
+                
+                if not caption and not self.config.no_caption:
+                    status = "retry"
+                elif not keywords:
+                    status = "retry"
+                else:
+                    status = "success"
+            
+            # Build new metadata dict
+            new_metadata = metadata.copy()
+            
+            # For description_only: preserve existing keywords
+            if generation_mode == "description_only":
+                # Don't overwrite keywords - keep existing ones
+                if caption:
+                    new_metadata["MWG:Description"] = caption
+                # Keywords remain from metadata.copy() above
+            
+            # For keywords_only: preserve existing description
+            elif generation_mode == "keywords_only":
+                # Always preserve existing description (even if empty)
+                if existing_caption is not None:
+                    new_metadata["MWG:Description"] = existing_caption
+                if keywords is not None:
+                    new_metadata["MWG:Keywords"] = keywords if keywords else []
+            
+            # For both: set both
+            else:  # generation_mode == "both"
+                if keywords is not None:
+                    new_metadata["MWG:Keywords"] = keywords if keywords else []
+                if caption:
+                    new_metadata["MWG:Description"] = caption
+            
+            # Set identifier if not present
+            if not new_metadata.get("XMP:Identifier"):
+                new_metadata["XMP:Identifier"] = str(uuid.uuid4())
+            
+            new_metadata["XMP:Status"] = status
+            
+            return new_metadata
+            
+        except Exception as e:
+            print(f"Error generating metadata: {e}")
+            new_metadata = metadata.copy()
+            new_metadata["XMP:Status"] = "failed"
+            return new_metadata
+    
+    def cleanup(self):
+        """Clean up resources"""
+        try:
+            self.et.terminate()
+        except:
+            pass
+
+class RegenerateThread(QThread):
+    """Thread for regenerating metadata for a single image"""
+    regeneration_complete = pyqtSignal(str, str, list, str, str, str, dict)  # base64_image, caption, keywords, filename, file_path, save_status, metadata
+    regeneration_error = pyqtSignal(str)  # error message
+    log_message = pyqtSignal(str)  # log message
+    
+    def __init__(self, config, base64_image, caption, keywords, filename, file_path, save_status, metadata):
+        super().__init__()
+        self.config = config
+        self.base64_image = base64_image
+        self.caption = caption
+        self.keywords = keywords
+        self.filename = filename
+        self.file_path = file_path
+        self.save_status = save_status
+        self.metadata = metadata
+    
+    def run(self):
+        """Run regeneration in background thread"""
+        try:
+            # Create regeneration helper
+            helper = RegenerationHelper(self.config)
+            
+            try:
+                # Use metadata from history as source of truth (has unsaved changes)
+                # Only read from file if status is "saved" to get the latest saved state
+                if self.save_status == "saved":
+                    # Read current metadata from file (has saved changes)
+                    current_metadata = helper.read_metadata(self.file_path)
+                    if not current_metadata:
+                        # Fallback to metadata from history
+                        current_metadata = self.metadata.copy()
+                    else:
+                        # Ensure SourceFile is set correctly
+                        current_metadata["SourceFile"] = self.file_path
+                        # Merge with history metadata to preserve any unsaved changes
+                        for key in ["MWG:Keywords", "MWG:Description"]:
+                            if key in self.metadata and key not in current_metadata:
+                                current_metadata[key] = self.metadata[key]
+                else:
+                    # Status is "pending" - use metadata from history (has unsaved changes)
+                    current_metadata = self.metadata.copy()
+                    current_metadata["SourceFile"] = self.file_path
+                
+                # Generate new metadata using existing processed_image (base64)
+                new_metadata = helper.generate_metadata(current_metadata, self.base64_image)
+                
+                # Extract new caption and keywords
+                new_caption = new_metadata.get("MWG:Description", "")
+                new_keywords = new_metadata.get("MWG:Keywords", [])
+                
+                # Determine new save_status (pending since we're in preview mode)
+                new_save_status = "pending"
+                
+                # Emit success signal with new data (matching image_history tuple order)
+                self.regeneration_complete.emit(
+                    self.base64_image, new_caption, new_keywords, 
+                    self.filename, self.file_path, new_save_status, new_metadata
+                )
+                
+            finally:
+                # Clean up helper
+                helper.cleanup()
+                
+        except Exception as e:
+            error_msg = f"Error regenerating metadata for {os.path.basename(self.filename)}: {str(e)}"
+            self.regeneration_error.emit(error_msg)
+
 class IndexerThread(QThread):
     output_received = pyqtSignal(str)
     image_processed = pyqtSignal(str, str, list, str, dict, str)  # base64_image, caption, keywords, filename, metadata, save_status
@@ -670,12 +919,46 @@ class KeywordWidget(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
     
     def clear(self):
-        # Clear keywords layout
-        for i in reversed(range(self.keywords_layout.count())): 
-            widget = self.keywords_layout.itemAt(i).widget()
-            if widget:
-                widget.deleteLater()
+        # Clear keywords layout synchronously
+        while self.keywords_layout.count():
+            item = self.keywords_layout.takeAt(0)
+            if item:
+                widget = item.widget()
+                if widget:
+                    widget.setParent(None)
+                    widget.deleteLater()
         self.keywords = []
+        # Force immediate update to ensure widgets are removed
+        QApplication.processEvents()
+    
+    def show_generating_message(self):
+        """Show a temporary 'Regenerating Keywords...' message"""
+        self.clear()
+        # Create a container widget for the message (similar to how keywords are displayed in rows)
+        message_widget = QWidget()
+        message_layout = QHBoxLayout(message_widget)
+        message_layout.setContentsMargins(0, 0, 0, 0)
+        message_layout.setSpacing(2)
+        
+        generating_label = QLabel("Regenerating Keywords...")
+        generating_label.setStyleSheet("color: #2196F3; font-style: italic; padding: 4px;")
+        generating_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        generating_label.setWordWrap(True)
+        # Ensure the label is visible and has proper size
+        generating_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        generating_label.setMinimumHeight(20)  # Ensure label has minimum height to be visible
+        
+        message_layout.addWidget(generating_label)
+        message_layout.addStretch()  # Push label to the left
+        
+        message_widget.show()
+        self.keywords_layout.addWidget(message_widget)
+        # Ensure container is visible and updated
+        self.keywords_container.show()
+        self.keywords_container.update()
+        self.update()  # Update the widget itself
+        # Force update to ensure label is displayed
+        QApplication.processEvents()
     
     def set_keywords(self, keywords):
         self.clear()
@@ -875,6 +1158,55 @@ class ImageIndexerGUI(QMainWindow):
         
         metadata_layout.addWidget(self.filename_label)
         
+        # Action buttons row (Save, Regenerate, Ignore)
+        action_buttons_layout = QHBoxLayout()
+        action_buttons_layout.setSpacing(10)
+        
+        self.save_button = QPushButton("Save")
+        self.save_button.setEnabled(False)  # Disabled initially
+        self.regenerate_button = QPushButton("Regenerate")
+        self.regenerate_button.setEnabled(False)  # Disabled initially
+        self.ignore_button = QPushButton("Ignore")
+        self.ignore_button.setEnabled(False)  # Disabled initially
+        
+        # Explicitly set button style to match default QPushButton appearance
+        # This ensures they look like the Settings button regardless of parent widget styles
+        button_style = """
+            QPushButton {
+                background-color: palette(button);
+                border: 1px solid palette(mid);
+                border-radius: 3px;
+                padding: 4px 12px;
+                min-width: 60px;
+            }
+            QPushButton:hover {
+                background-color: palette(light);
+            }
+            QPushButton:pressed {
+                background-color: palette(dark);
+            }
+            QPushButton:disabled {
+                background-color: #e0e0e0;
+                color: #888888;
+                border: 1px solid #c0c0c0;
+            }
+        """
+        self.save_button.setStyleSheet(button_style)
+        self.regenerate_button.setStyleSheet(button_style)
+        self.ignore_button.setStyleSheet(button_style)
+        
+        action_buttons_layout.addWidget(self.save_button)
+        action_buttons_layout.addWidget(self.regenerate_button)
+        action_buttons_layout.addWidget(self.ignore_button)
+        action_buttons_layout.addStretch()  # Push buttons to the left
+        
+        # Connect button signals
+        self.save_button.clicked.connect(self.save_current_image)
+        self.regenerate_button.clicked.connect(self.regenerate_current_image)
+        self.ignore_button.clicked.connect(self.ignore_current_image)
+        
+        metadata_layout.addLayout(action_buttons_layout)
+        
         # Caption
         caption_group = QGroupBox("Caption")
         caption_group.setStyleSheet("QGroupBox { border: none; }")
@@ -1017,9 +1349,14 @@ class ImageIndexerGUI(QMainWindow):
         if self.current_position == -1 or len(self.image_history) <= 1:
             self.current_position = -1  # Keep at most recent
             self.display_image(base64_image, caption, keywords, filename, save_status)
+            self.update_action_buttons(save_status)
         else:
             # Just update navigation buttons without changing the view
             self.update_navigation_buttons()
+            # Also update action buttons for the currently viewed image
+            if self.current_position >= 0 and self.current_position < len(self.image_history):
+                _, _, _, _, _, current_status, _ = self.image_history[self.current_position]
+                self.update_action_buttons(current_status)
             
     def display_image(self, base64_image, caption, keywords, filename, save_status="pending"):
         # Update the UI with the image data
@@ -1052,7 +1389,8 @@ class ImageIndexerGUI(QMainWindow):
         status_color = {
             'pending': '#ff8c00',  # Orange
             'saved': '#4caf50',     # Green
-            'ignored': '#808080'    # Gray
+            'ignored': '#808080',   # Gray
+            'generating': '#2196F3'  # Blue
         }.get(save_status.lower(), '#808080')
         
         # Use HTML table for proper alignment (QLabel supports basic HTML)
@@ -1065,12 +1403,14 @@ class ImageIndexerGUI(QMainWindow):
         self.caption_label.setText(caption or "No caption generated")
         self.keywords_widget.set_keywords(keywords or [])
         self.update_navigation_buttons()
+        self.update_action_buttons(save_status)
 
     def navigate_first(self):
         if self.image_history:
             self.current_position = 0
             base64_image, caption, keywords, filename, file_path, save_status, metadata = self.image_history[0]
             self.display_image(base64_image, caption, keywords, filename, save_status)
+            self.update_action_buttons(save_status)
 
     def navigate_prev(self):
         if not self.image_history:
@@ -1082,10 +1422,12 @@ class ImageIndexerGUI(QMainWindow):
                 self.current_position = len(self.image_history) - 2
                 base64_image, caption, keywords, filename, file_path, save_status, metadata = self.image_history[self.current_position]
                 self.display_image(base64_image, caption, keywords, filename, save_status)
+                self.update_action_buttons(save_status)
         elif self.current_position > 0:
             self.current_position -= 1
             base64_image, caption, keywords, filename, file_path, save_status, metadata = self.image_history[self.current_position]
             self.display_image(base64_image, caption, keywords, filename, save_status)
+            self.update_action_buttons(save_status)
 
     def navigate_next(self):
         if not self.image_history:
@@ -1102,13 +1444,274 @@ class ImageIndexerGUI(QMainWindow):
                 len(self.image_history) - 1 if self.current_position == -1 else self.current_position
             ]
             self.display_image(base64_image, caption, keywords, filename, save_status)
+            self.update_action_buttons(save_status)
 
     def navigate_last(self):
         if self.image_history:
             self.current_position = -1
             base64_image, caption, keywords, filename, file_path, save_status, metadata = self.image_history[-1]
             self.display_image(base64_image, caption, keywords, filename, save_status)
+            self.update_action_buttons(save_status)
 
+    def update_action_buttons(self, save_status="pending"):
+        """Update action button states based on save_status"""
+        # If empty status (no images), disable all buttons
+        if not save_status:
+            self.save_button.setEnabled(False)
+            self.regenerate_button.setEnabled(False)
+            self.ignore_button.setEnabled(False)
+            # Force visual update
+            self.save_button.update()
+            self.regenerate_button.update()
+            self.ignore_button.update()
+            QApplication.processEvents()
+            return
+        
+        # Save: only enabled when status is "pending"
+        self.save_button.setEnabled(save_status == "pending")
+        
+        # Regenerate: enabled when status is "pending" or "saved" (not when generating)
+        self.regenerate_button.setEnabled(save_status in ["pending", "saved"] and save_status != "generating")
+        
+        # Ignore: only enabled when status is "pending"
+        self.ignore_button.setEnabled(save_status == "pending")
+        
+        # Force visual update
+        self.save_button.update()
+        self.regenerate_button.update()
+        self.ignore_button.update()
+        QApplication.processEvents()
+    
+    def save_current_image(self):
+        """Save the current image's metadata to file"""
+        if not self.image_history or self.current_position < 0:
+            # If at most recent, use the last item
+            if self.current_position == -1 and self.image_history:
+                idx = len(self.image_history) - 1
+            else:
+                self.update_output("Error: No image selected to save.")
+                return
+        else:
+            idx = self.current_position
+        
+        # Get the current image data from history
+        base64_image, caption, keywords, filename, file_path, save_status, metadata = self.image_history[idx]
+        
+        # Only save if status is "pending"
+        if save_status != "pending":
+            self.update_output(f"Image {os.path.basename(filename)} is already saved or ignored.")
+            return
+        
+        try:
+            # Import exiftool for writing metadata
+            import exiftool
+            
+            # Get config settings from settings dialog
+            use_sidecar = self.settings_dialog.use_sidecar_checkbox.isChecked()
+            no_backup = self.settings_dialog.no_backup_checkbox.isChecked()
+            dry_run = self.settings_dialog.dry_run_checkbox.isChecked()
+            
+            if dry_run:
+                self.update_output(f"Dry run: Would save metadata to {os.path.basename(filename)}")
+                # Update status to "saved" even in dry run for UI consistency
+                self.image_history[idx] = (base64_image, caption, keywords, filename, file_path, "saved", metadata)
+                self.display_image(base64_image, caption, keywords, filename, "saved")
+                return
+            
+            # Prepare ExifTool parameters
+            params = ["-P"]
+            if no_backup or use_sidecar:
+                params.append("-overwrite_original")
+            
+            # Adjust file path for sidecar if needed
+            write_path = file_path
+            if use_sidecar:
+                write_path = file_path + ".xmp"
+            
+            # Write metadata using ExifTool
+            with exiftool.ExifToolHelper(encoding='utf-8') as et:
+                et.set_tags(write_path, tags=metadata, params=params)
+            
+            # Update status in history
+            self.image_history[idx] = (base64_image, caption, keywords, filename, file_path, "saved", metadata)
+            
+            # Refresh display
+            self.display_image(base64_image, caption, keywords, filename, "saved")
+            
+            # Log success
+            self.update_output(f"Successfully saved metadata to {os.path.basename(filename)}")
+            
+        except Exception as e:
+            error_msg = f"Error saving metadata to {os.path.basename(filename)}: {str(e)}"
+            self.update_output(error_msg)
+            print(error_msg)
+    
+    def ignore_current_image(self):
+        """Mark the current image as ignored"""
+        if not self.image_history or self.current_position < 0:
+            # If at most recent, use the last item
+            if self.current_position == -1 and self.image_history:
+                idx = len(self.image_history) - 1
+            else:
+                self.update_output("Error: No image selected to ignore.")
+                return
+        else:
+            idx = self.current_position
+        
+        # Get the current image data from history
+        base64_image, caption, keywords, filename, file_path, save_status, metadata = self.image_history[idx]
+        
+        # Only ignore if status is "pending"
+        if save_status != "pending":
+            self.update_output(f"Image {os.path.basename(filename)} cannot be ignored (already saved or ignored).")
+            return
+        
+        # Update status in history
+        self.image_history[idx] = (base64_image, caption, keywords, filename, file_path, "ignored", metadata)
+        
+        # Refresh display
+        self.display_image(base64_image, caption, keywords, filename, "ignored")
+        
+        # Log action
+        self.update_output(f"Ignored {os.path.basename(filename)}")
+    
+    def regenerate_current_image(self):
+        """Regenerate metadata for the current image"""
+        if not self.image_history or self.current_position < 0:
+            # If at most recent, use the last item
+            if self.current_position == -1 and self.image_history:
+                idx = len(self.image_history) - 1
+            else:
+                self.update_output("Error: No image selected to regenerate.")
+                return
+        else:
+            idx = self.current_position
+        
+        # Get the current image data from history
+        base64_image, caption, keywords, filename, file_path, save_status, metadata = self.image_history[idx]
+        
+        # Only regenerate if status is "pending" or "saved"
+        if save_status not in ["pending", "saved"]:
+            self.update_output(f"Image {os.path.basename(filename)} cannot be regenerated (status: {save_status}).")
+            return
+        
+        # Disable buttons during regeneration
+        self.save_button.setEnabled(False)
+        self.regenerate_button.setEnabled(False)
+        self.ignore_button.setEnabled(False)
+        QApplication.processEvents()
+        
+        # Check generation mode to determine if we're regenerating keywords
+        generation_mode = 'description_only' if self.settings_dialog.description_only_radio.isChecked() else ('keywords_only' if self.settings_dialog.keywords_only_radio.isChecked() else 'both')
+        
+        # Show "Generating" status
+        file_basename = os.path.basename(filename)
+        status_text = "Generating"
+        status_color = '#2196F3'  # Blue
+        filename_text = f"Filename: {file_basename}"
+        status_html = f'<span style="color: {status_color}; font-weight: bold;">[{status_text}]</span>'
+        html_content = f'<table width="100%"><tr><td>{filename_text}</td><td align="right">{status_html}</td></tr></table>'
+        self.filename_label.setText(html_content)
+        
+        if generation_mode == "keywords_only":
+            # Only regenerating keywords - preserve description, show generating message for keywords
+            self.caption_label.setText(caption or "No caption generated")  # Preserve existing description
+            self.keywords_widget.show_generating_message()  # Show "Regenerating Keywords..." message
+        elif generation_mode == "description_only":
+            # Only regenerating description - preserve keywords, show generating message for description
+            self.caption_label.setText('<span style="color: #2196F3; font-style: italic;">Regenerating Description...</span>')  # Show generating message with styling
+            # Don't update keywords - leave them as they are (no clear, no set_keywords call)
+        else:  # generation_mode == "both"
+            # Regenerating both - show generating messages for both
+            self.caption_label.setText('<span style="color: #2196F3; font-style: italic;">Regenerating Description...</span>')  # Show generating message with styling
+            self.keywords_widget.show_generating_message()  # Show "Regenerating Keywords..." message
+        
+        self.update_action_buttons("generating")
+        self.update_output(f"Regenerating metadata for {os.path.basename(filename)}...")
+        QApplication.processEvents()
+        
+        # Check if a regeneration thread is already running
+        if hasattr(self, 'regenerate_thread') and self.regenerate_thread and self.regenerate_thread.isRunning():
+            self.update_output("Regeneration already in progress. Please wait...")
+            return
+        
+        # Create config from current settings
+        config = llmii.Config()
+        config.api_url = self.settings_dialog.api_url_input.text()
+        config.api_password = self.settings_dialog.api_password_input.text()
+        config.system_instruction = self.settings_dialog.system_instruction_input.text()
+        config.generation_mode = generation_mode
+        config.instruction = self.settings_dialog.general_instruction_input.toPlainText()
+        config.caption_instruction = self.settings_dialog.description_instruction_input.toPlainText()
+        config.keyword_instruction = self.settings_dialog.keyword_instruction_input.toPlainText()
+        config.update_keywords = self.settings_dialog.update_keywords_checkbox.isChecked()
+        config.update_caption = self.settings_dialog.update_caption_checkbox.isChecked()
+        config.detailed_caption = self.settings_dialog.separate_query_radio.isChecked() if config.generation_mode == "both" else False
+        config.short_caption = not config.detailed_caption if config.generation_mode == "both" else True
+        config.no_caption = False
+        config.gen_count = self.settings_dialog.gen_count.value()
+        config.res_limit = self.settings_dialog.res_limit.value()
+        config.temperature = self.settings_dialog.temperature_spinbox.value()
+        config.top_p = self.settings_dialog.top_p_spinbox.value()
+        config.top_k = self.settings_dialog.top_k_spinbox.value()
+        config.min_p = self.settings_dialog.min_p_spinbox.value()
+        config.rep_pen = self.settings_dialog.rep_pen_spinbox.value()
+        config.use_sidecar = self.settings_dialog.use_sidecar_checkbox.isChecked()
+        config.normalize_keywords = True
+        config.depluralize_keywords = self.settings_dialog.depluralize_checkbox.isChecked()
+        config.limit_word_count = self.settings_dialog.word_limit_checkbox.isChecked()
+        config.max_words_per_keyword = self.settings_dialog.word_limit_spinbox.value()
+        config.split_and_entries = self.settings_dialog.split_and_checkbox.isChecked()
+        config.ban_prompt_words = self.settings_dialog.ban_prompt_words_checkbox.isChecked()
+        
+        # Store the index for updating history when regeneration completes
+        self.regenerate_idx = idx
+        self.regenerate_original_data = (base64_image, caption, keywords, filename, save_status)
+        
+        # Create and start regeneration thread
+        self.regenerate_thread = RegenerateThread(
+            config, base64_image, caption, keywords, filename, file_path, save_status, metadata
+        )
+        self.regenerate_thread.regeneration_complete.connect(self.on_regeneration_complete)
+        self.regenerate_thread.regeneration_error.connect(self.on_regeneration_error)
+        self.regenerate_thread.finished.connect(self.on_regeneration_finished)
+        self.regenerate_thread.start()
+    
+    def on_regeneration_complete(self, base64_image, new_caption, new_keywords, filename, file_path, new_save_status, new_metadata):
+        """Handle successful regeneration"""
+        # Update history entry
+        idx = self.regenerate_idx
+        self.image_history[idx] = (base64_image, new_caption, new_keywords, filename, file_path, new_save_status, new_metadata)
+        
+        # Refresh display
+        self.display_image(base64_image, new_caption, new_keywords, filename, new_save_status)
+        
+        # Log success
+        self.update_output(f"Successfully regenerated metadata for {os.path.basename(filename)}")
+    
+    def on_regeneration_error(self, error_msg):
+        """Handle regeneration error"""
+        self.update_output(error_msg)
+        print(error_msg)
+        
+        # Restore original display on error
+        base64_image, caption, keywords, filename, save_status = self.regenerate_original_data
+        self.display_image(base64_image, caption, keywords, filename, save_status)
+    
+    def on_regeneration_finished(self):
+        """Handle thread completion - re-enable buttons"""
+        # Re-enable buttons based on current status
+        if hasattr(self, 'regenerate_idx') and self.regenerate_idx < len(self.image_history):
+            _, _, _, _, _, save_status, _ = self.image_history[self.regenerate_idx]
+            self.update_action_buttons(save_status)
+        else:
+            # Fallback: enable buttons if we can't determine status
+            self.update_action_buttons("")
+        
+        # Clean up thread reference
+        if hasattr(self, 'regenerate_thread'):
+            self.regenerate_thread = None
+    
     def update_navigation_buttons(self):
         history_size = len(self.image_history)
         
@@ -1119,6 +1722,8 @@ class ImageIndexerGUI(QMainWindow):
             self.next_button.setEnabled(False)
             self.last_button.setEnabled(False)
             self.position_label.setText("No images processed")
+            # Disable action buttons when no images
+            self.update_action_buttons("")  # Empty status disables all buttons
             return
         
         # Determine position for display
@@ -1286,6 +1891,12 @@ class ImageIndexerGUI(QMainWindow):
         if self.api_check_thread and self.api_check_thread.isRunning():
             self.api_check_thread.stop()
             self.api_check_thread.wait()
+        
+        # Clean up regeneration thread if running
+        if hasattr(self, 'regenerate_thread') and self.regenerate_thread and self.regenerate_thread.isRunning():
+            self.regenerate_thread.terminate()
+            self.regenerate_thread.wait()
+        
         event.accept()
 
 def run_gui():
