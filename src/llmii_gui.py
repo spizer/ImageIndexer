@@ -544,7 +544,7 @@ class IndexerThread(QThread):
             # Extract the image data and emit signal
             base64_image = message.get('base64_image', '')
             caption = message.get('caption', '')
-            keywords = message.get('keywords', [])
+            keywords = message.get('keywords') or []  # Handle None explicitly
             file_path = message.get('file_path', '')
             self.image_processed.emit(base64_image, caption, keywords, file_path)
         else:

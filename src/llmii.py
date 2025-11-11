@@ -1185,7 +1185,7 @@ class FileProcessor:
         if all_keywords:        
             return list(all_keywords)
         else:
-            return None
+            return []
         
 def main(config=None, callback=None, check_paused_or_stopped=None):
     if config is None:
