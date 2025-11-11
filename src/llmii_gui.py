@@ -85,32 +85,6 @@ If humans are present, include:
 
 Use ENGLISH only. Generate ONLY a JSON object with the keys Description and Keywords as follows {"Description": str, "Keywords": []}"""
                 
-class InstructionDialog(QDialog):
-    def __init__(self, instruction_text, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Edit Instruction")
-        self.setModal(True)
-        self.resize(700, 500)
-        
-        layout = QVBoxLayout(self)
-        
-        self.instruction_input = QPlainTextEdit()
-        self.instruction_input.setPlainText(instruction_text)
-        layout.addWidget(QLabel("Edit Instruction:"))
-        layout.addWidget(self.instruction_input)
-        
-        button_layout = QHBoxLayout()
-        save_button = QPushButton("Save")
-        save_button.clicked.connect(self.accept)
-        cancel_button = QPushButton("Cancel")
-        cancel_button.clicked.connect(self.reject)
-        button_layout.addWidget(save_button)
-        button_layout.addWidget(cancel_button)
-        layout.addLayout(button_layout)
-    
-    def get_instruction(self):
-        return self.instruction_input.toPlainText()
-
 class SettingsHelpDialog(QDialog):
     """ Dialog that shows help information for all settings """
     
@@ -170,38 +144,78 @@ class SettingsDialog(QDialog):
         system_instruction_layout.addWidget(self.system_instruction_input)
         scroll_layout.addLayout(system_instruction_layout)
 
-        instruction_button_layout = QHBoxLayout()
-        self.edit_instruction_button = QPushButton("Edit Instruction")
-        self.edit_instruction_button.clicked.connect(self.edit_instruction)
-        instruction_button_layout.addWidget(self.edit_instruction_button)
-        scroll_layout.addLayout(instruction_button_layout)
+        # Instruction Settings Group
+        instruction_group = QGroupBox("Instruction Settings")
+        instruction_layout = QVBoxLayout()
+        
+        # General Instruction (for "Both" mode)
+        instruction_layout.addWidget(QLabel("General Instruction (for 'Both' mode):"))
+        self.general_instruction_input = QPlainTextEdit()
+        self.general_instruction_input.setFixedHeight(150)
+        self.general_instruction_input.setPlainText(GuiConfig.DEFAULT_INSTRUCTION)
+        instruction_layout.addWidget(self.general_instruction_input)
+        
+        # Description Instruction (for "Description only" mode)
+        instruction_layout.addWidget(QLabel("Description Instruction (for 'Description only' mode):"))
+        self.description_instruction_input = QPlainTextEdit()
+        self.description_instruction_input.setFixedHeight(120)
+        self.description_instruction_input.setPlainText("Describe the image. Be specific.")
+        instruction_layout.addWidget(self.description_instruction_input)
+        
+        # Keyword Instruction (for "Keywords only" mode)
+        instruction_layout.addWidget(QLabel("Keyword Instruction (for 'Keywords only' mode):"))
+        self.keyword_instruction_input = QPlainTextEdit()
+        self.keyword_instruction_input.setFixedHeight(150)
+        # Default will be set in load_settings if not in settings.json
+        instruction_layout.addWidget(self.keyword_instruction_input)
+        
+        instruction_group.setLayout(instruction_layout)
+        scroll_layout.addWidget(instruction_group)
 
-        caption_group = QGroupBox("Caption Options")
-        caption_layout = QVBoxLayout()
-
-        caption_instruction_layout = QHBoxLayout()
-        self.caption_instruction_input = QLineEdit("Describe the image in detail. Be specific.")
-        caption_instruction_layout.addWidget(QLabel("Caption Instruction:"))
-        caption_instruction_layout.addWidget(self.caption_instruction_input)
-        caption_layout.addLayout(caption_instruction_layout)
-
-        self.caption_radio_group = QButtonGroup(self)
-        self.detailed_caption_radio = QRadioButton("Separate caption query")
-        self.short_caption_radio = QRadioButton("Combined caption query")
-        self.no_caption_radio = QRadioButton("No caption query")
-
-        self.caption_radio_group.addButton(self.detailed_caption_radio)
-        self.caption_radio_group.addButton(self.short_caption_radio)
-        self.caption_radio_group.addButton(self.no_caption_radio)
-
-        self.short_caption_radio.setChecked(True)
-
-        caption_layout.addWidget(self.detailed_caption_radio)
-        caption_layout.addWidget(self.short_caption_radio)
-        caption_layout.addWidget(self.no_caption_radio)
-
-        caption_group.setLayout(caption_layout)
-        scroll_layout.addWidget(caption_group)
+        # Generation Mode Options
+        generation_mode_group = QGroupBox("Generation Mode")
+        generation_mode_layout = QVBoxLayout()
+        
+        self.generation_mode_radio_group = QButtonGroup(self)
+        self.both_radio = QRadioButton("Both (Description and Keywords)")
+        self.description_only_radio = QRadioButton("Description only")
+        self.keywords_only_radio = QRadioButton("Keywords only")
+        
+        self.generation_mode_radio_group.addButton(self.both_radio)
+        self.generation_mode_radio_group.addButton(self.description_only_radio)
+        self.generation_mode_radio_group.addButton(self.keywords_only_radio)
+        
+        self.both_radio.setChecked(True)  # Default to "both"
+        
+        generation_mode_layout.addWidget(self.both_radio)
+        
+        # Sub-options for "Both" mode (query method) - placed between Both and Description
+        self.both_options_widget = QWidget()
+        both_options_layout = QVBoxLayout(self.both_options_widget)
+        both_options_layout.setContentsMargins(20, 5, 0, 5)  # Indent sub-options
+        
+        self.both_query_radio_group = QButtonGroup(self)
+        self.combined_query_radio = QRadioButton("Combined query (single API call)")
+        self.separate_query_radio = QRadioButton("Separate queries (two API calls)")
+        
+        self.both_query_radio_group.addButton(self.combined_query_radio)
+        self.both_query_radio_group.addButton(self.separate_query_radio)
+        
+        self.combined_query_radio.setChecked(True)  # Default to combined
+        
+        both_options_layout.addWidget(self.combined_query_radio)
+        both_options_layout.addWidget(self.separate_query_radio)
+        
+        generation_mode_layout.addWidget(self.both_options_widget)
+        generation_mode_layout.addWidget(self.description_only_radio)
+        generation_mode_layout.addWidget(self.keywords_only_radio)
+        
+        # Connect radio buttons to show/hide sub-options
+        self.both_radio.toggled.connect(self.update_both_options_visibility)
+        self.update_both_options_visibility(self.both_radio.isChecked())
+        
+        generation_mode_group.setLayout(generation_mode_layout)
+        scroll_layout.addWidget(generation_mode_group)
 
         gen_count_layout = QHBoxLayout()
         self.gen_count = QSpinBox()
@@ -385,19 +399,24 @@ class SettingsDialog(QDialog):
         button_layout.addWidget(cancel_button)
         layout.addLayout(button_layout)
 
-        self.instruction_text = GuiConfig.DEFAULT_INSTRUCTION
+        # Get default keyword instruction from Config
+        from .llmii import Config
+        default_config = Config()
+        self.default_keyword_instruction = default_config.keyword_instruction
         
         self.load_settings()
+        
+        # Ensure visibility is set correctly after loading (in case no settings file exists)
+        self.update_both_options_visibility(self.both_radio.isChecked())
     
     def show_help(self):
         """Show the settings help dialog"""
         dialog = SettingsHelpDialog(self)
         dialog.exec()
-        
-    def edit_instruction(self):
-        dialog = InstructionDialog(self.instruction_text, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.instruction_text = dialog.get_instruction()
+    
+    def update_both_options_visibility(self, is_checked):
+        """Show/hide sub-options when 'Both' mode is selected"""
+        self.both_options_widget.setVisible(is_checked)
         
     def load_settings(self):
         try:
@@ -410,7 +429,26 @@ class SettingsDialog(QDialog):
                 self.system_instruction_input.setText(settings.get('system_instruction', 'You are a helpful assistant.'))
                 self.gen_count.setValue(settings.get('gen_count', 250))
                 self.res_limit.setValue(settings.get('res_limit', 448))
-                self.instruction_text = settings.get('instruction', GuiConfig.DEFAULT_INSTRUCTION)
+                
+                # Load instruction settings with migration support
+                # If old 'instruction' key exists but new keys don't, migrate it
+                if 'instruction' in settings and 'general_instruction' not in settings:
+                    # Migrate old instruction to general_instruction
+                    self.general_instruction_input.setPlainText(settings.get('instruction', GuiConfig.DEFAULT_INSTRUCTION))
+                else:
+                    self.general_instruction_input.setPlainText(settings.get('general_instruction', GuiConfig.DEFAULT_INSTRUCTION))
+                
+                # Load description instruction (migrate from old caption_instruction if needed)
+                if 'description_instruction' in settings:
+                    self.description_instruction_input.setPlainText(settings.get('description_instruction', 'Describe the image. Be specific.'))
+                elif 'caption_instruction' in settings:
+                    # Migrate old caption_instruction
+                    self.description_instruction_input.setPlainText(settings.get('caption_instruction', 'Describe the image. Be specific.'))
+                else:
+                    self.description_instruction_input.setPlainText('Describe the image. Be specific.')
+                
+                # Load keyword instruction
+                self.keyword_instruction_input.setPlainText(settings.get('keyword_instruction', self.default_keyword_instruction))
                 
                 self.no_crawl_checkbox.setChecked(settings.get('no_crawl', False))
                 self.reprocess_failed_checkbox.setChecked(settings.get('reprocess_failed', False))
@@ -421,16 +459,45 @@ class SettingsDialog(QDialog):
                 self.skip_verify_checkbox.setChecked(settings.get('skip_verify', False))
                 self.quick_fail_checkbox.setChecked(settings.get('quick_fail', False))
                 self.use_sidecar_checkbox.setChecked(settings.get('use_sidecar', False))
-                self.caption_instruction_input.setText(settings.get('caption_instruction', 'Describe the image in detail. Be specific.'))
                 
-                # Set radio button based on settings
-                if settings.get('detailed_caption', False):
-                    self.detailed_caption_radio.setChecked(True)
-                elif settings.get('no_caption', False):
-                    self.no_caption_radio.setChecked(True)
+                # Load generation mode setting
+                generation_mode = settings.get('generation_mode', 'both')
+                if generation_mode == 'description_only':
+                    self.description_only_radio.setChecked(True)
+                    self.both_radio.setChecked(False)
+                    self.keywords_only_radio.setChecked(False)
+                elif generation_mode == 'keywords_only':
+                    self.keywords_only_radio.setChecked(True)
+                    self.both_radio.setChecked(False)
+                    self.description_only_radio.setChecked(False)
                 else:
-                    # Default to short caption
-                    self.short_caption_radio.setChecked(True)
+                    self.both_radio.setChecked(True)
+                    self.description_only_radio.setChecked(False)
+                    self.keywords_only_radio.setChecked(False)
+                
+                # Load both mode query method (migrate from old detailed_caption/short_caption)
+                # If old settings exist, migrate them
+                if 'detailed_caption' in settings:
+                    if settings.get('detailed_caption', False):
+                        self.separate_query_radio.setChecked(True)
+                        self.combined_query_radio.setChecked(False)
+                    else:
+                        self.combined_query_radio.setChecked(True)
+                        self.separate_query_radio.setChecked(False)
+                elif 'both_query_method' in settings:
+                    if settings.get('both_query_method') == 'separate':
+                        self.separate_query_radio.setChecked(True)
+                        self.combined_query_radio.setChecked(False)
+                    else:
+                        self.combined_query_radio.setChecked(True)
+                        self.separate_query_radio.setChecked(False)
+                else:
+                    # Default to combined
+                    self.combined_query_radio.setChecked(True)
+                    self.separate_query_radio.setChecked(False)
+                
+                # Update visibility based on selected mode
+                self.update_both_options_visibility(self.both_radio.isChecked())
                     
                 self.update_keywords_checkbox.setChecked(settings.get('update_keywords', True))
                 self.update_caption_checkbox.setChecked(settings.get('update_caption', False))
@@ -460,7 +527,9 @@ class SettingsDialog(QDialog):
             'api_url': self.api_url_input.text(),
             'api_password': self.api_password_input.text(),
             'system_instruction': self.system_instruction_input.text(),
-            'instruction': self.instruction_text,
+            'general_instruction': self.general_instruction_input.toPlainText(),
+            'description_instruction': self.description_instruction_input.toPlainText(),
+            'keyword_instruction': self.keyword_instruction_input.toPlainText(),
             'gen_count': self.gen_count.value(),
             'res_limit': self.res_limit.value(),
             'no_crawl': self.no_crawl_checkbox.isChecked(),
@@ -472,11 +541,9 @@ class SettingsDialog(QDialog):
             'skip_verify': self.skip_verify_checkbox.isChecked(),
             'quick_fail': self.quick_fail_checkbox.isChecked(),
             'update_keywords': self.update_keywords_checkbox.isChecked(),
-            'caption_instruction': self.caption_instruction_input.text(),
-            'detailed_caption': self.detailed_caption_radio.isChecked(),
-            'short_caption': self.short_caption_radio.isChecked(),
-            'no_caption': self.no_caption_radio.isChecked(),
             'update_caption': self.update_caption_checkbox.isChecked(),
+            'generation_mode': 'description_only' if self.description_only_radio.isChecked() else ('keywords_only' if self.keywords_only_radio.isChecked() else 'both'),
+            'both_query_method': 'separate' if self.separate_query_radio.isChecked() else 'combined',
             'use_sidecar': self.use_sidecar_checkbox.isChecked(),
             'depluralize_keywords': self.depluralize_checkbox.isChecked(),
             'limit_word_count': self.word_limit_checkbox.isChecked(),
@@ -544,7 +611,7 @@ class IndexerThread(QThread):
             # Extract the image data and emit signal
             base64_image = message.get('base64_image', '')
             caption = message.get('caption', '')
-            keywords = message.get('keywords') or []  # Handle None explicitly
+            keywords = message.get('keywords', [])
             file_path = message.get('file_path', '')
             self.image_processed.emit(base64_image, caption, keywords, file_path)
         else:
@@ -1089,14 +1156,34 @@ class ImageIndexerGUI(QMainWindow):
         config.min_word_length = self.settings_dialog.min_word_length_checkbox.isChecked()
         config.latin_only = self.settings_dialog.latin_only_checkbox.isChecked()
         
-        # Load caption settings
-        config.detailed_caption = self.settings_dialog.detailed_caption_radio.isChecked()
-        config.short_caption = self.settings_dialog.short_caption_radio.isChecked()
-        config.no_caption = self.settings_dialog.no_caption_radio.isChecked()
-        config.caption_instruction = self.settings_dialog.caption_instruction_input.text()
+        # Load caption instruction
+        config.caption_instruction = self.settings_dialog.description_instruction_input.toPlainText()
         
-        # Load instruction from settings
-        config.instruction = self.settings_dialog.instruction_text
+        # Load generation mode setting
+        if self.settings_dialog.description_only_radio.isChecked():
+            config.generation_mode = "description_only"
+            config.detailed_caption = False
+            config.short_caption = False
+            config.no_caption = False
+        elif self.settings_dialog.keywords_only_radio.isChecked():
+            config.generation_mode = "keywords_only"
+            config.detailed_caption = False
+            config.short_caption = False
+            config.no_caption = True  # Don't generate caption in keywords_only mode
+        else:
+            config.generation_mode = "both"
+            config.no_caption = False
+            # Set detailed_caption based on both_query_method
+            if self.settings_dialog.separate_query_radio.isChecked():
+                config.detailed_caption = True
+                config.short_caption = False
+            else:
+                config.detailed_caption = False
+                config.short_caption = True
+        
+        # Load instruction settings
+        config.instruction = self.settings_dialog.general_instruction_input.toPlainText()
+        config.keyword_instruction = self.settings_dialog.keyword_instruction_input.toPlainText()
         
         config.update_keywords = self.settings_dialog.update_keywords_checkbox.isChecked()
         config.update_caption = self.settings_dialog.update_caption_checkbox.isChecked()

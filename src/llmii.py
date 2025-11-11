@@ -266,6 +266,7 @@ class Config:
         self.no_caption = False
         self.update_caption = False
         self.use_sidecar = False
+        self.generation_mode = "both"  # Options: "description_only", "keywords_only", "both"
         self.normalize_keywords = True
         self.depluralize_keywords = False
         self.limit_word_count = True
@@ -277,7 +278,30 @@ class Config:
         self.latin_only = True
         self.caption_instruction = "Describe the image. Be specific"
         self.system_instruction = "You are a helpful assistant."
-        self.keyword_instruction = ""
+        self.keyword_instruction = """Return a JSON object containing only a list of Keywords.
+
+Generate 5 to 10 Keywords. Each Keyword is an item in a list and will be composed of a maximum of two words.
+
+For Keywords, make sure to include:
+
+ - Themes, concepts
+ - Items, animals, objects
+ - Structures, landmarks, setting
+ - Foreground and background elements
+ - Notable colors, textures, styles
+ - Actions, activities
+
+If humans are present, include:
+ - Physical appearance
+ - Gender
+ - Clothing
+ - Age range
+ - Visibly apparent ancestry
+ - Occupation/role
+ - Relationships between individuals
+ - Emotions, expressions, body language
+
+Use ENGLISH only. Generate ONLY a JSON object with the key Keywords as follows {"Keywords": []}"""
 
         # Sampler settings
         self.temperature = 0.2
@@ -420,6 +444,7 @@ class LLMProcessor:
         self.instruction = config.instruction
         self.system_instruction = config.system_instruction
         self.caption_instruction = config.caption_instruction
+        self.keyword_instruction = config.keyword_instruction or config.instruction  # Fallback to full instruction if empty
         self.requests = requests
         self.api_password = config.api_password
         self.max_tokens = config.gen_count
@@ -443,6 +468,9 @@ class LLMProcessor:
         
         elif task == "caption_and_keywords":
             instruction = self.instruction
+        
+        elif task == "keywords_only":
+            instruction = self.keyword_instruction
         
         else:
             print(f"invalid task: {task}")
@@ -1078,47 +1106,82 @@ class FileProcessor:
         
         try:
             
-            # Determine whether to generate caption, keywords, or both
-            if not self.config.no_caption and self.config.detailed_caption:
-                data = clean_json(self.llm_processor.describe_content(task="keywords", processed_image=processed_image))
-                detailed_caption = clean_string(self.llm_processor.describe_content(task="caption", processed_image=processed_image))               
+            # Determine what to generate based on generation_mode
+            generation_mode = getattr(self.config, 'generation_mode', 'both')
+            
+            if generation_mode == "description_only":
+                # Generate only description
+                detailed_caption = clean_string(self.llm_processor.describe_content(task="caption", processed_image=processed_image))
                 
                 if existing_caption and self.config.update_caption:
                     caption = existing_caption + "<generated>" + detailed_caption + "</generated>"
-                
                 else:
                     caption = detailed_caption
                 
-                if isinstance(data, dict):
-                    keywords = data.get("Keywords")
-                   
-            else:
-                data = clean_json(self.llm_processor.describe_content(task="caption_and_keywords", processed_image=processed_image))
-                         
-                if isinstance(data, dict):
-                    keywords = data.get("Keywords")
+                keywords = []  # No keywords generated
+                status = "success" if caption else "retry"
                 
-                    if not existing_caption and not self.config.no_caption:
-                        caption = data.get("Description")
+            elif generation_mode == "keywords_only":
+                # Generate only keywords
+                data = clean_json(self.llm_processor.describe_content(task="keywords_only", processed_image=processed_image))
+                
+                if isinstance(data, dict):
+                    keywords = data.get("Keywords")
+                else:
+                    keywords = None
+                
+                caption = existing_caption  # Keep existing caption, don't generate new one
+                
+                if not keywords:
+                    status = "retry"
+                else:
+                    status = "success"
+                    keywords = self.process_keywords(metadata, keywords)
                     
-                    elif existing_caption and self.config.update_caption:
-                        caption = existing_caption + "<generated>" + data.get("Description") + "</generated>"
+            else:  # generation_mode == "both" (default)
+                # Generate both description and keywords
+                if not self.config.no_caption and self.config.detailed_caption:
+                    # Use separate instructions for description and keywords
+                    data = clean_json(self.llm_processor.describe_content(task="keywords_only", processed_image=processed_image))
+                    detailed_caption = clean_string(self.llm_processor.describe_content(task="caption", processed_image=processed_image))               
                     
-                    elif data.get("Description") and not self.config.no_caption:
-                        caption = data.get("Description")
+                    if existing_caption and self.config.update_caption:
+                        caption = existing_caption + "<generated>" + detailed_caption + "</generated>"
                     
                     else:
-                        caption = existing_caption
+                        caption = detailed_caption
+                    
+                    if isinstance(data, dict):
+                        keywords = data.get("Keywords")
+                       
+                else:
+                    data = clean_json(self.llm_processor.describe_content(task="caption_and_keywords", processed_image=processed_image))
+                             
+                    if isinstance(data, dict):
+                        keywords = data.get("Keywords")
+                    
+                        if not existing_caption and not self.config.no_caption:
+                            caption = data.get("Description")
                         
-            if not keywords:
-                status = "retry"
+                        elif existing_caption and self.config.update_caption:
+                            caption = existing_caption + "<generated>" + data.get("Description") + "</generated>"
+                        
+                        elif data.get("Description") and not self.config.no_caption:
+                            caption = data.get("Description")
+                        
+                        else:
+                            caption = existing_caption
                             
-            else:
-                status = "success"
-                keywords = self.process_keywords(metadata, keywords)
+                if not keywords:
+                    status = "retry"
+                                
+                else:
+                    status = "success"
+                    keywords = self.process_keywords(metadata, keywords)
 
             new_metadata["MWG:Description"] = caption
-            new_metadata["MWG:Keywords"] = keywords
+            # Ensure keywords is always a list, not None
+            new_metadata["MWG:Keywords"] = keywords if keywords is not None else []
             new_metadata["XMP:Status"] = status
             new_metadata["XMP:Identifier"] = metadata.get("XMP:Identifier", str(uuid.uuid4()))
             new_metadata["SourceFile"] = file_path
