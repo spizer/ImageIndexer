@@ -309,6 +309,11 @@ class SettingsDialog(QDialog):
         options_group = QGroupBox("File Options")
         options_layout = QVBoxLayout()
         
+        # Auto-save option (preview mode control) - at top of File Options
+        self.auto_save_checkbox = QCheckBox("Auto-save (write metadata automatically)")
+        self.auto_save_checkbox.setChecked(False)  # Default to preview mode
+        options_layout.addWidget(self.auto_save_checkbox)
+        
         self.no_crawl_checkbox = QCheckBox("Don't go in subdirectories")
         self.reprocess_all_checkbox = QCheckBox("Reprocess everything")
         self.reprocess_failed_checkbox = QCheckBox("Reprocess failures")
@@ -459,6 +464,7 @@ class SettingsDialog(QDialog):
                 self.skip_verify_checkbox.setChecked(settings.get('skip_verify', False))
                 self.quick_fail_checkbox.setChecked(settings.get('quick_fail', False))
                 self.use_sidecar_checkbox.setChecked(settings.get('use_sidecar', False))
+                self.auto_save_checkbox.setChecked(settings.get('auto_save', False))
                 
                 # Load generation mode setting
                 generation_mode = settings.get('generation_mode', 'both')
@@ -545,6 +551,7 @@ class SettingsDialog(QDialog):
             'generation_mode': 'description_only' if self.description_only_radio.isChecked() else ('keywords_only' if self.keywords_only_radio.isChecked() else 'both'),
             'both_query_method': 'separate' if self.separate_query_radio.isChecked() else 'combined',
             'use_sidecar': self.use_sidecar_checkbox.isChecked(),
+            'auto_save': self.auto_save_checkbox.isChecked(),
             'depluralize_keywords': self.depluralize_checkbox.isChecked(),
             'limit_word_count': self.word_limit_checkbox.isChecked(),
             'max_words_per_keyword': self.word_limit_spinbox.value(),
@@ -596,7 +603,7 @@ class APICheckThread(QThread):
         
 class IndexerThread(QThread):
     output_received = pyqtSignal(str)
-    image_processed = pyqtSignal(str, str, list, str)  # base64_image, caption, keywords, filename
+    image_processed = pyqtSignal(str, str, list, str, dict, str)  # base64_image, caption, keywords, filename, metadata, save_status
 
     def __init__(self, config):
         super().__init__()
@@ -611,9 +618,11 @@ class IndexerThread(QThread):
             # Extract the image data and emit signal
             base64_image = message.get('base64_image', '')
             caption = message.get('caption', '')
-            keywords = message.get('keywords', [])
+            keywords = message.get('keywords') or []  # Handle None explicitly
             file_path = message.get('file_path', '')
-            self.image_processed.emit(base64_image, caption, keywords, file_path)
+            metadata = message.get('metadata', {})
+            save_status = message.get('save_status', 'pending')
+            self.image_processed.emit(base64_image, caption, keywords, file_path, metadata, save_status)
         else:
             # Regular text message for the log
             self.output_received.emit(str(message))
@@ -924,7 +933,7 @@ class ImageIndexerGUI(QMainWindow):
         self.api_check_thread = None
         self.api_is_ready = False
         self.run_button.setEnabled(False)
-        self.image_history = []  # [(base64_image, caption, keywords, filename)]
+        self.image_history = []  # [(base64_image, caption, keywords, filename, file_path, save_status, metadata_dict)]
         self.current_position = -1
         
         if os.path.exists('settings.json'):
@@ -991,25 +1000,28 @@ class ImageIndexerGUI(QMainWindow):
             self.api_status_label.setStyleSheet("color: red; padding: 4px")
             self.run_button.setEnabled(False)
     
-    def update_image_preview(self, base64_image, caption, keywords, filename):
+    def update_image_preview(self, base64_image, caption, keywords, filename, metadata, save_status):
         self.previous_image_data = base64_image
         self.previous_caption = caption
         self.previous_keywords = keywords
         self.previous_filename = filename
         
-        # Add to history
-        self.image_history.append((base64_image, caption, keywords, filename))
+        # Extract file_path from metadata if not provided directly
+        file_path = metadata.get('SourceFile', filename) if isinstance(metadata, dict) else filename
+        
+        # Add to history with extended structure
+        self.image_history.append((base64_image, caption, keywords, filename, file_path, save_status, metadata))
         
         # If user was viewing the most recent image (or this is the first image),
         # update current_position to point to the new image
         if self.current_position == -1 or len(self.image_history) <= 1:
             self.current_position = -1  # Keep at most recent
-            self.display_image(base64_image, caption, keywords, filename)
+            self.display_image(base64_image, caption, keywords, filename, save_status)
         else:
             # Just update navigation buttons without changing the view
             self.update_navigation_buttons()
             
-    def display_image(self, base64_image, caption, keywords, filename):
+    def display_image(self, base64_image, caption, keywords, filename, save_status="pending"):
         # Update the UI with the image data
         try:
             # Convert base64 to QImage
@@ -1034,7 +1046,22 @@ class ImageIndexerGUI(QMainWindow):
             self.image_preview.setText(f"Error: {str(e)}")
         
         file_basename = os.path.basename(filename)
-        self.filename_label.setText(f"Filename: {file_basename}")
+        
+        # Update filename label with save status (right-aligned)
+        status_text = save_status.capitalize()
+        status_color = {
+            'pending': '#ff8c00',  # Orange
+            'saved': '#4caf50',     # Green
+            'ignored': '#808080'    # Gray
+        }.get(save_status.lower(), '#808080')
+        
+        # Use HTML table for proper alignment (QLabel supports basic HTML)
+        filename_text = f"Filename: {file_basename}"
+        status_html = f'<span style="color: {status_color}; font-weight: bold;">[{status_text}]</span>'
+        # Use a table to achieve right alignment
+        html_content = f'<table width="100%"><tr><td>{filename_text}</td><td align="right">{status_html}</td></tr></table>'
+        self.filename_label.setText(html_content)
+        
         self.caption_label.setText(caption or "No caption generated")
         self.keywords_widget.set_keywords(keywords or [])
         self.update_navigation_buttons()
@@ -1042,8 +1069,8 @@ class ImageIndexerGUI(QMainWindow):
     def navigate_first(self):
         if self.image_history:
             self.current_position = 0
-            base64_image, caption, keywords, filename = self.image_history[0]
-            self.display_image(base64_image, caption, keywords, filename)
+            base64_image, caption, keywords, filename, file_path, save_status, metadata = self.image_history[0]
+            self.display_image(base64_image, caption, keywords, filename, save_status)
 
     def navigate_prev(self):
         if not self.image_history:
@@ -1053,12 +1080,12 @@ class ImageIndexerGUI(QMainWindow):
             # If at the most recent, go to the second most recent
             if len(self.image_history) > 1:
                 self.current_position = len(self.image_history) - 2
-                base64_image, caption, keywords, filename = self.image_history[self.current_position]
-                self.display_image(base64_image, caption, keywords, filename)
+                base64_image, caption, keywords, filename, file_path, save_status, metadata = self.image_history[self.current_position]
+                self.display_image(base64_image, caption, keywords, filename, save_status)
         elif self.current_position > 0:
             self.current_position -= 1
-            base64_image, caption, keywords, filename = self.image_history[self.current_position]
-            self.display_image(base64_image, caption, keywords, filename)
+            base64_image, caption, keywords, filename, file_path, save_status, metadata = self.image_history[self.current_position]
+            self.display_image(base64_image, caption, keywords, filename, save_status)
 
     def navigate_next(self):
         if not self.image_history:
@@ -1071,16 +1098,16 @@ class ImageIndexerGUI(QMainWindow):
             if self.current_position == len(self.image_history) - 1:
                 self.current_position = -1
                 
-            base64_image, caption, keywords, filename = self.image_history[
+            base64_image, caption, keywords, filename, file_path, save_status, metadata = self.image_history[
                 len(self.image_history) - 1 if self.current_position == -1 else self.current_position
             ]
-            self.display_image(base64_image, caption, keywords, filename)
+            self.display_image(base64_image, caption, keywords, filename, save_status)
 
     def navigate_last(self):
         if self.image_history:
             self.current_position = -1
-            base64_image, caption, keywords, filename = self.image_history[-1]
-            self.display_image(base64_image, caption, keywords, filename)
+            base64_image, caption, keywords, filename, file_path, save_status, metadata = self.image_history[-1]
+            self.display_image(base64_image, caption, keywords, filename, save_status)
 
     def update_navigation_buttons(self):
         history_size = len(self.image_history)
@@ -1187,6 +1214,7 @@ class ImageIndexerGUI(QMainWindow):
         
         config.update_keywords = self.settings_dialog.update_keywords_checkbox.isChecked()
         config.update_caption = self.settings_dialog.update_caption_checkbox.isChecked()
+        config.auto_save = self.settings_dialog.auto_save_checkbox.isChecked()
         config.gen_count = self.settings_dialog.gen_count.value()
         config.res_limit = self.settings_dialog.res_limit.value()
 

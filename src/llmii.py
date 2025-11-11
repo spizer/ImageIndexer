@@ -267,6 +267,7 @@ class Config:
         self.update_caption = False
         self.use_sidecar = False
         self.generation_mode = "both"  # Options: "description_only", "keywords_only", "both"
+        self.auto_save = False  # If False, preview mode (don't auto-write). If True, auto-write like current behavior.
         self.normalize_keywords = True
         self.depluralize_keywords = False
         self.limit_word_count = True
@@ -1020,10 +1021,20 @@ class FileProcessor:
                 self.callback(f"---")
                 metadata["XMP:Status"] = "failed"
                 
-                if not self.config.dry_run:
-                    self.write_metadata(file_path, metadata)
+                # Failed files are never auto-written, even if auto_save is on
+                # (They can be manually saved later if user wants)
                 return
                 
+            # Determine save status
+            if self.config.auto_save and not self.config.dry_run:
+                # Auto-save mode: write immediately
+                save_status = "saved"
+                if not self.config.dry_run:
+                    self.write_metadata(file_path, updated_metadata)
+            else:
+                # Preview mode: don't write, mark as pending
+                save_status = "pending"
+            
             # Send image data to callback for GUI display
             if self.callback and hasattr(self.callback, '__call__'):
                 
@@ -1033,13 +1044,12 @@ class FileProcessor:
                     'base64_image': processed_image,
                     'caption': updated_metadata.get('MWG:Description', ''),
                     'keywords': updated_metadata.get('MWG:Keywords', []),
-                    'file_path': file_path
+                    'file_path': file_path,
+                    'metadata': updated_metadata,  # Include full metadata for saving later
+                    'save_status': save_status
                 }
                 
-                self.callback(image_data)    
-                
-            if not self.config.dry_run:
-                self.write_metadata(file_path, updated_metadata)
+                self.callback(image_data)
                 
             print(f"{status}: {file_path}")
             end_time = time.time()
