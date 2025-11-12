@@ -883,8 +883,9 @@ class FileProcessor:
             # Does file have a UUID in metadata
             if identifier:
                 if not self.config.reprocess_all and status == "success":
-                    
-                    return None
+                    # Return metadata with flag to skip LLM processing but still display in GUI
+                    metadata["_skip_llm"] = True
+                    return metadata
                     
                 # If it is retry, do it again
                 if self.config.reprocess_all or status == "retry":
@@ -1003,39 +1004,53 @@ class FileProcessor:
                 
             start_time = time.time()
             
+            # Check if we should skip LLM processing (for already-saved files)
+            skip_llm = metadata.get("_skip_llm", False)
+            
             processed_image, image_path = self.image_processor.process_image(file_path)
-            updated_metadata = self.generate_metadata(metadata, processed_image)
-           
-            status = updated_metadata.get("XMP:Status")
             
-            # Retry one time if failed
-            if not self.config.quick_fail and status == "retry":
-                print(f"Retrying {file_path} once")
-                self.callback(f"Retrying {file_path}...")
-                self.callback(f"---")
-                updated_metadata = self.generate_metadata(metadata, processed_image)      
-                status = updated_metadata.get("XMP:Status")
-            
-            # If retry didn't work, mark failed
-            if not status == "success":
-                print(f"failed: {file_path}")
-                self.callback(f"Retry failed: {file_path}")
-                self.callback(f"---")
-                metadata["XMP:Status"] = "failed"
-                
-                # Failed files are never auto-written, even if auto_save is on
-                # (They can be manually saved later if user wants)
-                return
-                
-            # Determine save status
-            if self.config.auto_save and not self.config.dry_run:
-                # Auto-save mode: write immediately
+            if skip_llm:
+                # Skip LLM processing, use existing metadata
+                # Remove the flag before sending to GUI
+                updated_metadata = metadata.copy()
+                updated_metadata.pop("_skip_llm", None)
+                status = updated_metadata.get("XMP:Status", "success")
+                # File is already saved, so save_status is "saved"
                 save_status = "saved"
-                if not self.config.dry_run:
-                    self.write_metadata(file_path, updated_metadata)
             else:
-                # Preview mode: don't write, mark as pending
-                save_status = "pending"
+                # Normal processing: generate new metadata via LLM
+                updated_metadata = self.generate_metadata(metadata, processed_image)
+               
+                status = updated_metadata.get("XMP:Status")
+                
+                # Retry one time if failed
+                if not self.config.quick_fail and status == "retry":
+                    print(f"Retrying {file_path} once")
+                    self.callback(f"Retrying {file_path}...")
+                    self.callback(f"---")
+                    updated_metadata = self.generate_metadata(metadata, processed_image)      
+                    status = updated_metadata.get("XMP:Status")
+                
+                # If retry didn't work, mark failed
+                if not status == "success":
+                    print(f"failed: {file_path}")
+                    self.callback(f"Retry failed: {file_path}")
+                    self.callback(f"---")
+                    metadata["XMP:Status"] = "failed"
+                    
+                    # Failed files are never auto-written, even if auto_save is on
+                    # (They can be manually saved later if user wants)
+                    return
+                    
+                # Determine save status
+                if self.config.auto_save and not self.config.dry_run:
+                    # Auto-save mode: write immediately
+                    save_status = "saved"
+                    if not self.config.dry_run:
+                        self.write_metadata(file_path, updated_metadata)
+                else:
+                    # Preview mode: don't write, mark as pending
+                    save_status = "pending"
             
             # Send image data to callback for GUI display
             if self.callback and hasattr(self.callback, '__call__'):

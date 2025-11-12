@@ -20,8 +20,91 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
 from PyQt6.QtGui import QPixmap, QImage, QPalette, QColor, QFont, QIcon
 
 
-from . import llmii
-from . import help_text
+# Handle imports for both normal execution and py2app bundle
+try:
+    from . import llmii
+    from . import help_text
+except ImportError:
+    # Running as main script (e.g., in py2app bundle)
+    import sys
+    import os
+    
+    if hasattr(sys, 'frozen'):
+        # Running from py2app bundle
+        # py2app sets RESOURCEPATH environment variable to Contents/Resources/
+        resourcepath = os.environ.get('RESOURCEPATH')
+        if resourcepath and os.path.exists(resourcepath):
+            resources_dir = resourcepath
+        else:
+            # Fallback: get from __file__
+            try:
+                resources_dir = os.path.dirname(os.path.abspath(__file__))
+            except NameError:
+                # Last fallback: get from executable path
+                bundle_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(sys.executable))))
+                resources_dir = os.path.join(bundle_dir, "Contents", "Resources")
+        
+        # Add lib/python3.9 to path (parent of src/)
+        lib_path = os.path.join(resources_dir, 'lib', 'python3.9')
+        
+        # Debug: print paths to help diagnose
+        print(f"DEBUG: resources_dir={resources_dir}")
+        print(f"DEBUG: lib_path={lib_path}")
+        print(f"DEBUG: lib_path exists={os.path.exists(lib_path)}")
+        
+        if os.path.exists(lib_path):
+            # Verify src directory exists
+            src_path = os.path.join(lib_path, 'src')
+            print(f"DEBUG: src_path={src_path}")
+            print(f"DEBUG: src_path exists={os.path.exists(src_path)}")
+            
+            if os.path.exists(src_path):
+                # Add to path and verify it's there
+                if lib_path not in sys.path:
+                    sys.path.insert(0, lib_path)
+                print(f"DEBUG: sys.path[0:3]={sys.path[0:3]}")
+                print(f"DEBUG: lib_path in sys.path={lib_path in sys.path}")
+                print(f"DEBUG: lib_path index in sys.path={sys.path.index(lib_path) if lib_path in sys.path else 'NOT FOUND'}")
+                
+                # Check what's in src directory
+                try:
+                    src_contents = os.listdir(src_path)
+                    print(f"DEBUG: src directory contents={src_contents}")
+                    print(f"DEBUG: llmii.py exists={os.path.exists(os.path.join(src_path, 'llmii.py'))}")
+                    print(f"DEBUG: help_text.py exists={os.path.exists(os.path.join(src_path, 'help_text.py'))}")
+                    print(f"DEBUG: __init__.py exists={os.path.exists(os.path.join(src_path, '__init__.py'))}")
+                except Exception as e:
+                    print(f"DEBUG: Error listing src directory: {e}")
+                
+                # Try the import
+                try:
+                    import src.llmii as llmii
+                    import src.help_text as help_text
+                except ImportError as e:
+                    # More detailed error
+                    raise ImportError(
+                        f"Failed to import src.llmii. "
+                        f"lib_path={lib_path}, "
+                        f"src_path={src_path}, "
+                        f"sys.path[0]={sys.path[0] if sys.path else 'empty'}, "
+                        f"error={str(e)}"
+                    )
+            else:
+                raise ImportError(
+                    f"Could not find src directory at {src_path}. "
+                    f"Resources dir: {resources_dir}, lib_path: {lib_path}"
+                )
+        else:
+            raise ImportError(
+                f"Could not find lib/python3.9 directory at {lib_path}. "
+                f"Resources dir: {resources_dir}"
+            )
+    else:
+        # Normal execution - add project root to path
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        sys.path.insert(0, project_root)
+        import src.llmii as llmii
+        import src.help_text as help_text
 
 class GuiConfig:
     """ Configuration class for GUI dimensions and properties
@@ -775,6 +858,87 @@ class RegenerationHelper:
             new_metadata["XMP:Status"] = "failed"
             return new_metadata
     
+    def prepare_metadata_for_save(self, metadata):
+        """Prepare metadata dictionary for saving to file
+        
+        Ensures all required fields are present and correctly formatted:
+        - XMP:Status set to "success"
+        - MWG:Keywords is a list (not None)
+        - XMP:Identifier exists (creates if missing)
+        - SourceFile is preserved for ExifTool
+        
+        Args:
+            metadata: Metadata dictionary to prepare
+            
+        Returns:
+            Prepared metadata dictionary ready for writing
+        """
+        # Create a copy to avoid modifying the original
+        prepared = metadata.copy()
+        
+        # Ensure status is "success" when saving
+        prepared["XMP:Status"] = "success"
+        
+        # Ensure keywords is always a list, not None
+        if "MWG:Keywords" not in prepared or prepared["MWG:Keywords"] is None:
+            prepared["MWG:Keywords"] = []
+        elif not isinstance(prepared["MWG:Keywords"], list):
+            # Handle case where keywords might be a string
+            if isinstance(prepared["MWG:Keywords"], str):
+                prepared["MWG:Keywords"] = [prepared["MWG:Keywords"]]
+            else:
+                prepared["MWG:Keywords"] = []
+        
+        # Ensure identifier exists
+        if "XMP:Identifier" not in prepared or not prepared["XMP:Identifier"]:
+            prepared["XMP:Identifier"] = str(uuid.uuid4())
+        
+        # Ensure SourceFile is set (needed by ExifTool to identify the file)
+        # Note: ExifTool uses SourceFile internally but doesn't write it as a tag
+        if "SourceFile" not in prepared:
+            # This shouldn't happen, but handle gracefully
+            pass
+        
+        return prepared
+    
+    def write_metadata(self, file_path, metadata, use_sidecar=False, no_backup=False, dry_run=False):
+        """Write metadata to file using ExifTool
+        
+        Reuses logic from FileProcessor.write_metadata() but adapted for GUI use.
+        
+        Args:
+            file_path: Path to the image file
+            metadata: Metadata dictionary to write
+            use_sidecar: Whether to write to sidecar .xmp file
+            no_backup: Whether to skip creating backup files
+            dry_run: If True, don't actually write (for testing)
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        if dry_run:
+            return True
+        
+        try:
+            params = ["-P"]
+            
+            if no_backup or use_sidecar:
+                params.append("-overwrite_original")
+            
+            # Adjust file path for sidecar if needed
+            write_path = file_path
+            if use_sidecar:
+                write_path = file_path + ".xmp"
+            
+            # Use existing ExifTool instance
+            self.et.set_tags(write_path, tags=metadata, params=params)
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error writing metadata to {file_path}: {str(e)}")
+            return False
+    
     def cleanup(self):
         """Clean up resources"""
         try:
@@ -1048,12 +1212,39 @@ class ImageIndexerGUI(QMainWindow):
         dir_layout.addWidget(dir_button)
         controls_layout.addLayout(dir_layout)
 
-        # Settings button and API status in one row
+        # Settings button, Auto-save toggle, and API status in one row
         settings_api_layout = QHBoxLayout()
         settings_button = QPushButton("Settings")
         settings_button.clicked.connect(self.show_settings)
+        
+        # Auto-save toggle button
+        self.auto_save_button = QPushButton("Auto-save: OFF")
+        self.auto_save_button.setCheckable(True)
+        self.auto_save_button.setChecked(False)  # Default to preview mode
+        self.auto_save_button.clicked.connect(self.toggle_auto_save)
+        self.auto_save_button.setStyleSheet("""
+            QPushButton {
+                background-color: #555555;
+                border: 1px solid palette(mid);
+                border-radius: 3px;
+                padding: 4px 12px;
+                min-width: 100px;
+            }
+            QPushButton:checked {
+                background-color: #4CAF50;
+                color: white;
+            }
+            QPushButton:hover {
+                background-color: palette(light);
+            }
+            QPushButton:checked:hover {
+                background-color: #45a049;
+            }
+        """)
+        
         self.api_status_label = QLabel("API Status: Checking...")
         settings_api_layout.addWidget(settings_button)
+        settings_api_layout.addWidget(self.auto_save_button)
         settings_api_layout.addStretch(1)
         settings_api_layout.addWidget(self.api_status_label)
         controls_layout.addLayout(settings_api_layout)
@@ -1249,6 +1440,13 @@ class ImageIndexerGUI(QMainWindow):
                 with open('settings.json', 'r') as f:
                     settings = json.load(f)
                     self.dir_input.setText(settings.get('directory', ''))
+                    # Sync auto-save button with settings
+                    auto_save_enabled = settings.get('auto_save', False)
+                    self.auto_save_button.setChecked(auto_save_enabled)
+                    if auto_save_enabled:
+                        self.auto_save_button.setText("Auto-save: ON")
+                    else:
+                        self.auto_save_button.setText("Auto-save: OFF")
                     self.start_api_check(settings.get('api_url', 'http://localhost:5001'))
                     
             except Exception as e:
@@ -1257,9 +1455,40 @@ class ImageIndexerGUI(QMainWindow):
         else:
             self.start_api_check('http://localhost:5001')
 
+    def toggle_auto_save(self):
+        """Toggle auto-save mode and update UI"""
+        is_enabled = self.auto_save_button.isChecked()
+        
+        if is_enabled:
+            self.auto_save_button.setText("Auto-save: ON")
+            # Sync with settings dialog
+            self.settings_dialog.auto_save_checkbox.setChecked(True)
+        else:
+            self.auto_save_button.setText("Auto-save: OFF")
+            # Sync with settings dialog
+            self.settings_dialog.auto_save_checkbox.setChecked(False)
+        
+        # Update Save button state based on current image
+        if self.image_history:
+            if self.current_position == -1:
+                idx = len(self.image_history) - 1
+            else:
+                idx = self.current_position
+            if idx >= 0 and idx < len(self.image_history):
+                _, _, _, _, _, save_status, _ = self.image_history[idx]
+                self.update_action_buttons(save_status)
+    
     def show_settings(self):
         if self.settings_dialog.exec() == QDialog.DialogCode.Accepted:
             self.settings_dialog.save_settings()
+            
+            # Sync auto-save button with settings dialog
+            auto_save_enabled = self.settings_dialog.auto_save_checkbox.isChecked()
+            self.auto_save_button.setChecked(auto_save_enabled)
+            if auto_save_enabled:
+                self.auto_save_button.setText("Auto-save: ON")
+            else:
+                self.auto_save_button.setText("Auto-save: OFF")
             
             self.start_api_check(self.settings_dialog.api_url_input.text())
             
@@ -1459,8 +1688,11 @@ class ImageIndexerGUI(QMainWindow):
             QApplication.processEvents()
             return
         
-        # Save: only enabled when status is "pending"
-        self.save_button.setEnabled(save_status == "pending")
+        # Check if auto-save is enabled
+        auto_save_enabled = self.auto_save_button.isChecked()
+        
+        # Save: only enabled when status is "pending" AND auto-save is disabled
+        self.save_button.setEnabled(save_status == "pending" and not auto_save_enabled)
         
         # Regenerate: enabled when status is "pending" or "saved"
         self.regenerate_button.setEnabled(save_status in ["pending", "saved"])
@@ -1494,49 +1726,68 @@ class ImageIndexerGUI(QMainWindow):
             self.update_output(f"Image {os.path.basename(filename)} is already saved or ignored.")
             return
         
+        # Create minimal config for helper (only needed for initialization)
+        config = llmii.Config()
+        config.use_sidecar = self.settings_dialog.use_sidecar_checkbox.isChecked()
+        config.no_backup = self.settings_dialog.no_backup_checkbox.isChecked()
+        config.dry_run = self.settings_dialog.dry_run_checkbox.isChecked()
+        
+        # Create helper for writing metadata
+        helper = RegenerationHelper(config)
+        
         try:
-            # Import exiftool for writing metadata
-            import exiftool
-            
             # Get config settings from settings dialog
-            use_sidecar = self.settings_dialog.use_sidecar_checkbox.isChecked()
-            no_backup = self.settings_dialog.no_backup_checkbox.isChecked()
-            dry_run = self.settings_dialog.dry_run_checkbox.isChecked()
+            use_sidecar = config.use_sidecar
+            no_backup = config.no_backup
+            dry_run = config.dry_run
+            
+            # Prepare metadata for saving (ensures status="success", keywords is list, etc.)
+            prepared_metadata = helper.prepare_metadata_for_save(metadata)
+            
+            # Ensure SourceFile is set correctly
+            prepared_metadata["SourceFile"] = file_path
             
             if dry_run:
                 self.update_output(f"Dry run: Would save metadata to {os.path.basename(filename)}")
                 # Update status to "saved" even in dry run for UI consistency
-                self.image_history[idx] = (base64_image, caption, keywords, filename, file_path, "saved", metadata)
+                # Use prepared metadata so status is "success"
+                self.image_history[idx] = (base64_image, caption, keywords, filename, file_path, "saved", prepared_metadata)
                 self.display_image(base64_image, caption, keywords, filename, "saved")
+                self.update_action_buttons("saved")
                 return
             
-            # Prepare ExifTool parameters
-            params = ["-P"]
-            if no_backup or use_sidecar:
-                params.append("-overwrite_original")
+            # Write metadata using helper
+            success = helper.write_metadata(
+                file_path, 
+                prepared_metadata, 
+                use_sidecar=use_sidecar, 
+                no_backup=no_backup, 
+                dry_run=dry_run
+            )
             
-            # Adjust file path for sidecar if needed
-            write_path = file_path
-            if use_sidecar:
-                write_path = file_path + ".xmp"
-            
-            # Write metadata using ExifTool
-            with exiftool.ExifToolHelper(encoding='utf-8') as et:
-                et.set_tags(write_path, tags=metadata, params=params)
-            
-            # Update status in history
-            self.image_history[idx] = (base64_image, caption, keywords, filename, file_path, "saved", metadata)
-            
-            # Refresh display
-            self.display_image(base64_image, caption, keywords, filename, "saved")
-            
-            # Log success
-            self.update_output(f"Successfully saved metadata to {os.path.basename(filename)}")
+            if success:
+                # Update status in history with prepared metadata
+                self.image_history[idx] = (base64_image, caption, keywords, filename, file_path, "saved", prepared_metadata)
+                
+                # Refresh display
+                self.display_image(base64_image, caption, keywords, filename, "saved")
+                self.update_action_buttons("saved")
+                
+                # Log success
+                self.update_output(f"Successfully saved metadata to {os.path.basename(filename)}")
+            else:
+                # Write failed
+                error_msg = f"Failed to save metadata to {os.path.basename(filename)}"
+                self.update_output(error_msg)
+                print(error_msg)
             
         except Exception as e:
             error_msg = f"Error saving metadata to {os.path.basename(filename)}: {str(e)}"
             self.update_output(error_msg)
             print(error_msg)
+        finally:
+            # Clean up helper
+            helper.cleanup()
     
     def ignore_current_image(self):
         """Mark the current image as ignored"""
@@ -1675,11 +1926,57 @@ class ImageIndexerGUI(QMainWindow):
         idx = self.regenerate_idx
         self.image_history[idx] = (base64_image, new_caption, new_keywords, filename, file_path, new_save_status, new_metadata)
         
+        # Check if auto-save is enabled - if so, automatically save
+        if self.auto_save_button.isChecked():
+            # Auto-save the regenerated metadata
+            try:
+                # Create minimal config for helper
+                config = llmii.Config()
+                config.use_sidecar = self.settings_dialog.use_sidecar_checkbox.isChecked()
+                config.no_backup = self.settings_dialog.no_backup_checkbox.isChecked()
+                config.dry_run = self.settings_dialog.dry_run_checkbox.isChecked()
+                
+                helper = RegenerationHelper(config)
+                try:
+                    # Prepare metadata for saving
+                    prepared_metadata = helper.prepare_metadata_for_save(new_metadata)
+                    prepared_metadata["SourceFile"] = file_path
+                    
+                    if not config.dry_run:
+                        # Write metadata
+                        success = helper.write_metadata(
+                            file_path,
+                            prepared_metadata,
+                            use_sidecar=config.use_sidecar,
+                            no_backup=config.no_backup,
+                            dry_run=config.dry_run
+                        )
+                        
+                        if success:
+                            # Update status to "saved"
+                            self.image_history[idx] = (base64_image, new_caption, new_keywords, filename, file_path, "saved", prepared_metadata)
+                            new_save_status = "saved"
+                            self.update_output(f"Auto-saved regenerated metadata to {os.path.basename(filename)}")
+                        else:
+                            self.update_output(f"Warning: Failed to auto-save regenerated metadata to {os.path.basename(filename)}")
+                    else:
+                        # Dry run - just update status
+                        self.image_history[idx] = (base64_image, new_caption, new_keywords, filename, file_path, "saved", prepared_metadata)
+                        new_save_status = "saved"
+                        self.update_output(f"Dry run: Would auto-save regenerated metadata to {os.path.basename(filename)}")
+                finally:
+                    helper.cleanup()
+            except Exception as e:
+                error_msg = f"Error auto-saving regenerated metadata: {str(e)}"
+                self.update_output(error_msg)
+                print(error_msg)
+        
         # Refresh display
         self.display_image(base64_image, new_caption, new_keywords, filename, new_save_status)
         
         # Log success
-        self.update_output(f"Successfully regenerated metadata for {os.path.basename(filename)}")
+        if not self.auto_save_button.isChecked():
+            self.update_output(f"Successfully regenerated metadata for {os.path.basename(filename)}")
     
     def on_regeneration_error(self, error_msg):
         """Handle regeneration error"""
@@ -1831,7 +2128,8 @@ class ImageIndexerGUI(QMainWindow):
         
         config.update_keywords = self.settings_dialog.update_keywords_checkbox.isChecked()
         config.update_caption = self.settings_dialog.update_caption_checkbox.isChecked()
-        config.auto_save = self.settings_dialog.auto_save_checkbox.isChecked()
+        # Use auto-save button state (which is synced with settings dialog)
+        config.auto_save = self.auto_save_button.isChecked()
         config.gen_count = self.settings_dialog.gen_count.value()
         config.res_limit = self.settings_dialog.res_limit.value()
 

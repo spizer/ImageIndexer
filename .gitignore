@@ -8,3 +8,7 @@ koboldcpp.exe
 *.exe
 resources/kobold_args.json
 resources/koboldcpp-*
+
+# Phase 9: macOS .app Bundle Setup - Build artifacts
+/build/
+/dist/
