@@ -7,7 +7,7 @@ import requests
 import uuid
 import exiftool
 
-from PyQt6.QtCore import QThread, pyqtSignal, QObject, Qt, QSize
+from PyQt6.QtCore import QThread, pyqtSignal, QObject, Qt, QSize, QTimer, QPoint
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                            QLabel, QLineEdit, QCheckBox, QPushButton, QFileDialog,
                            QTextEdit, QGroupBox, QSpinBox, QDoubleSpinBox, QRadioButton, QButtonGroup,
@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                            QSizePolicy, QSpacerItem)
 
 
-from PyQt6.QtGui import QPixmap, QImage, QPalette, QColor, QFont, QIcon
+from PyQt6.QtGui import QPixmap, QImage, QPalette, QColor, QFont, QIcon, QPainter, QPen, QMouseEvent, QEnterEvent, QCursor
 
 
 # Handle imports for both normal execution and py2app bundle
@@ -169,7 +169,7 @@ If humans are present, include:
  - Emotions, expressions, body language
 
 Use ENGLISH only. Generate ONLY a JSON object with the keys Description and Keywords as follows {"Description": str, "Keywords": []}"""
-                
+
 class SettingsHelpDialog(QDialog):
     """ Dialog that shows help information for all settings """
     
@@ -503,7 +503,7 @@ class SettingsDialog(QDialog):
         """Show the settings help dialog"""
         dialog = SettingsHelpDialog(self)
         dialog.exec()
-    
+        
     def update_both_options_visibility(self, is_checked):
         """Show/hide sub-options when 'Both' mode is selected"""
         self.both_options_widget.setVisible(is_checked)
@@ -708,9 +708,12 @@ class RegenerationHelper:
             if self.config.use_sidecar and os.path.exists(file_path + ".xmp"):
                 file_path = file_path + ".xmp"
             
-            # Read metadata using same fields as FileProcessor
+            # Read metadata - include both MWG and Composite fields as fallback
             exiftool_fields = [
-                "SourceFile", "MWG:Keywords", "MWG:Description", "XMP:Identifier", "XMP:Status"
+                "SourceFile", 
+                "MWG:Keywords", "MWG:Description",
+                "Composite:Keywords", "Composite:Description",  # Fallback fields
+                "XMP:Identifier", "XMP:Status"
             ]
             
             result = self.et.get_tags([file_path], tags=exiftool_fields)
@@ -952,7 +955,7 @@ class RegenerateThread(QThread):
     regeneration_error = pyqtSignal(str)  # error message
     log_message = pyqtSignal(str)  # log message
     
-    def __init__(self, config, base64_image, caption, keywords, filename, file_path, save_status, metadata):
+    def __init__(self, config, base64_image, caption, keywords, filename, file_path, save_status, metadata, manual_keywords=None):
         super().__init__()
         self.config = config
         self.base64_image = base64_image
@@ -962,6 +965,7 @@ class RegenerateThread(QThread):
         self.file_path = file_path
         self.save_status = save_status
         self.metadata = metadata
+        self.manual_keywords = set(manual_keywords) if manual_keywords else set()
     
     def run(self):
         """Run regeneration in background thread"""
@@ -997,6 +1001,15 @@ class RegenerateThread(QThread):
                 new_caption = new_metadata.get("MWG:Description", "")
                 new_keywords = new_metadata.get("MWG:Keywords", [])
                 
+                # Merge manual keywords with generated keywords (preserve manual ones)
+                if self.manual_keywords:
+                    # Convert manual keywords to lowercase for comparison
+                    manual_keywords_lower = {kw.lower() for kw in self.manual_keywords}
+                    # Add manual keywords that aren't already in generated keywords
+                    for manual_kw in self.manual_keywords:
+                        if manual_kw.lower() not in {kw.lower() for kw in new_keywords}:
+                            new_keywords.append(manual_kw)
+                
                 # Determine new save_status (pending since we're in preview mode)
                 new_save_status = "pending"
                 
@@ -1013,7 +1026,7 @@ class RegenerateThread(QThread):
         except Exception as e:
             error_msg = f"Error regenerating metadata for {os.path.basename(self.filename)}: {str(e)}"
             self.regeneration_error.emit(error_msg)
-
+        
 class IndexerThread(QThread):
     output_received = pyqtSignal(str)
     image_processed = pyqtSignal(str, str, list, str, dict, str)  # base64_image, caption, keywords, filename, metadata, save_status
@@ -1057,12 +1070,211 @@ class IndexerThread(QThread):
                 raise Exception("Indexer stopped by user")
         return self.paused
 
+class CustomTooltip(QLabel):
+    """Custom tooltip widget that can be positioned above the cursor"""
+    
+    def __init__(self, text, parent=None):
+        super().__init__(parent)
+        self.setText(text)
+        self.setWordWrap(True)
+        self.setMaximumWidth(500)
+        self.setStyleSheet("""
+            QLabel {
+                background-color: #2b2b2b;
+                color: white;
+                padding: 4px 8px;
+                border: 1px solid #555555;
+                border-radius: 4px;
+                font-size: 9px;
+            }
+        """)
+        self.setWindowFlags(Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+        self.adjustSize()
+    
+    def showAtPosition(self, global_pos):
+        """Show tooltip above the cursor position"""
+        # Position above cursor with small offset
+        tooltip_height = self.height()
+        tooltip_width = self.width()
+        x = global_pos.x() - tooltip_width // 2
+        y = global_pos.y() - tooltip_height - 10  # 10px above cursor
+        self.move(x, y)
+        self.show()
+
+class KeywordPillWidget(QWidget):
+    """Custom widget for keyword pill with integrated remove button"""
+    
+    def __init__(self, keyword, is_manual=False, parent=None):
+        super().__init__(parent)
+        self.keyword = keyword
+        self.is_manual = is_manual
+        
+        # Create horizontal layout
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 2, 2, 2)  # Left padding for text, right padding for button
+        layout.setSpacing(4)
+        
+        # Define colors based on whether this is a manual keyword
+        if is_manual:
+            # Green theme for manual keywords
+            text_color = "#22aa22"
+            bg_color = "#d4f4d4"  # Light green background
+            border_color = "#88dd88"  # Medium green border
+            button_color = "#22aa22"  # Green text for remove button
+        else:
+            # Default blue theme for generated keywords
+            text_color = GuiConfig.COLOR_KEYWORD_TEXT
+            bg_color = GuiConfig.COLOR_KEYWORD_BG
+            border_color = GuiConfig.COLOR_KEYWORD_BORDER
+            button_color = GuiConfig.COLOR_KEYWORD_TEXT
+        
+        # Keyword text label - allow it to expand to show full text
+        self.keyword_label = QLabel(keyword)
+        self.keyword_label.setWordWrap(False)  # Don't wrap text
+        self.keyword_label.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Preferred)
+        self.keyword_label.setStyleSheet(f"""
+            background-color: transparent;
+            color: {text_color};
+            padding: 0px;
+            border: none;
+            font-size: {GuiConfig.FONT_SIZE_NORMAL}px;
+        """)
+        
+        # Remove button (12x12, integrated)
+        self.remove_button = QPushButton("×")
+        self.remove_button.setFixedSize(12, 12)
+        self.remove_button.setToolTip("Remove Keyword")
+        self.remove_button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: transparent;
+                color: {button_color};
+                border: none;
+                border-radius: 6px;
+                font-weight: bold;
+                font-size: 8px;
+                padding: 0px;
+                min-width: 12px;
+                max-width: 12px;
+                min-height: 12px;
+                max-height: 12px;
+            }}
+            QPushButton:hover {{
+                background-color: #ff4444;
+                color: white;
+            }}
+            QPushButton:pressed {{
+                background-color: #cc0000;
+                color: white;
+            }}
+        """)
+        
+        # Add widgets to layout - label should expand, button stays fixed
+        layout.addWidget(self.keyword_label, 1)  # Stretch factor 1 to allow expansion
+        layout.addWidget(self.remove_button, 0)  # No stretch for button
+        
+        # Set fixed height, flexible width - use Preferred to allow expansion
+        self.setFixedHeight(20)  # Fixed height for consistent appearance
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        
+        # Store colors for paintEvent
+        self.bg_color = bg_color
+        self.border_color = border_color
+        
+        # Custom tooltip for keyword text
+        self.custom_tooltip = None
+        self.tooltip_timer = QTimer()
+        self.tooltip_timer.setSingleShot(True)
+        self.tooltip_timer.timeout.connect(self.show_tooltip)
+        
+        # Enable mouse tracking for tooltip
+        self.setMouseTracking(True)
+    
+    def paintEvent(self, event):
+        """Override paintEvent to draw the pill background with rounded corners"""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        # Draw rounded rectangle background
+        rect = self.rect().adjusted(0, 0, -1, -1)  # Adjust for border
+        painter.setBrush(QColor(self.bg_color))
+        painter.setPen(QPen(QColor(self.border_color), 1))
+        painter.drawRoundedRect(rect, 4, 4)  # 4px radius for rounded corners
+        
+        super().paintEvent(event)
+    
+    def enterEvent(self, event):
+        """Show tooltip after a short delay when mouse enters"""
+        # Store the cursor position for tooltip positioning
+        if isinstance(event, QEnterEvent):
+            self.last_cursor_pos = event.globalPosition().toPoint()
+        else:
+            # Fallback: get current global cursor position
+            self.last_cursor_pos = QCursor.pos()
+        self.tooltip_timer.start(500)  # 500ms delay
+        super().enterEvent(event)
+    
+    def mouseMoveEvent(self, event):
+        """Update cursor position for tooltip"""
+        self.last_cursor_pos = event.globalPosition().toPoint()
+        super().mouseMoveEvent(event)
+    
+    def leaveEvent(self, event):
+        """Hide tooltip when mouse leaves"""
+        self.tooltip_timer.stop()
+        if self.custom_tooltip:
+            self.custom_tooltip.hide()
+            self.custom_tooltip.deleteLater()
+            self.custom_tooltip = None
+        super().leaveEvent(event)
+    
+    def show_tooltip(self):
+        """Show the custom tooltip above the cursor"""
+        if not self.custom_tooltip:
+            self.custom_tooltip = CustomTooltip(self.keyword, self.window())
+        # Use the stored cursor position
+        if hasattr(self, 'last_cursor_pos'):
+            self.custom_tooltip.showAtPosition(self.last_cursor_pos)
+        else:
+            # Fallback to center if position not available
+            cursor_pos = self.mapToGlobal(self.rect().center())
+            self.custom_tooltip.showAtPosition(cursor_pos)
+
 class KeywordWidget(QWidget):
+    keywords_changed = pyqtSignal(list)  # Signal emitted when keywords change
+    
     def __init__(self, parent=None):
         super().__init__(parent)
         self.keywords = []
+        self.manual_keywords = set()  # Track manually added keywords
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(GuiConfig.CONTENT_MARGINS, GuiConfig.CONTENT_MARGINS, GuiConfig.CONTENT_MARGINS, GuiConfig.CONTENT_MARGINS)
+        
+        # Add input field and button for adding keywords
+        input_container = QWidget()
+        input_container_layout = QVBoxLayout(input_container)
+        input_container_layout.setContentsMargins(0, 0, 0, 0)
+        input_container_layout.setSpacing(4)
+        
+        input_layout = QHBoxLayout()
+        input_layout.setSpacing(4)
+        self.keyword_input = QLineEdit()
+        self.keyword_input.setPlaceholderText("Enter keyword...")
+        self.keyword_input.textChanged.connect(self.validate_input_realtime)
+        self.keyword_input.returnPressed.connect(self.add_keyword_from_input)
+        self.add_button = QPushButton("Add")
+        self.add_button.clicked.connect(self.add_keyword_from_input)
+        self.add_button.setEnabled(False)  # Initially disabled
+        input_layout.addWidget(self.keyword_input)
+        input_layout.addWidget(self.add_button)
+        input_container_layout.addLayout(input_layout)
+        
+        # Error message label (initially hidden)
+        self.error_label = QLabel("Only letters, numbers, and spaces allowed")
+        self.error_label.setStyleSheet("color: #ff4444; font-size: 11px; padding: 2px 0px;")
+        self.error_label.hide()
+        input_container_layout.addWidget(self.error_label)
+        
+        self.layout.addWidget(input_container)
         
         # Create the container for keyword rows
         self.keywords_container = QWidget()
@@ -1075,8 +1287,7 @@ class KeywordWidget(QWidget):
         # Set fixed size policy for container
         self.keywords_container.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         
-        # Add header and container to layout
-        #self.layout.addWidget(QLabel("Keywords:"))
+        # Add container to layout
         self.layout.addWidget(self.keywords_container)
         
         # Ensure widget doesn't expand beyond its allocated space
@@ -1124,54 +1335,183 @@ class KeywordWidget(QWidget):
         # Force update to ensure label is displayed
         QApplication.processEvents()
     
-    def set_keywords(self, keywords):
+    def set_keywords(self, keywords, manual_keywords=None):
+        """Set keywords to display
+        
+        Args:
+            keywords: List of keyword strings
+            manual_keywords: Set of manually added keywords (for green styling)
+        """
         self.clear()
         self.keywords = keywords
         
-        # Display keywords in rows
-        max_per_row = GuiConfig.KEYWORDS_PER_ROW
+        # Update manual_keywords set if provided
+        if manual_keywords is not None:
+            self.manual_keywords = manual_keywords.copy() if isinstance(manual_keywords, set) else set(manual_keywords)
+        
+        if not keywords:
+            return
+        
+        # Display keywords with natural wrapping based on available width
+        # Get the container width for wrapping calculation
+        container_width = self.keywords_container.width()
+        if container_width <= 0:
+            # If container hasn't been sized yet, use a default
+            container_width = 400
+        
         current_row = 0
         row_layouts = []
+        current_row_width = 0
+        spacing = 2  # Spacing between keywords
         
         # Create the first row
         row_widget = QWidget()
         row_layout = QHBoxLayout(row_widget)
         row_layout.setContentsMargins(0, 0, 0, 0)
-        row_layout.setSpacing(2)
+        row_layout.setSpacing(spacing)
         row_layouts.append(row_layout)
         self.keywords_layout.addWidget(row_widget)
         
-        # Add keyword labels
-        for i, keyword in enumerate(keywords):
-            # Check if we need to start a new row
-            if i > 0 and i % max_per_row == 0:
-                # Create a new row
+        # Add keyword pills with natural wrapping
+        for keyword in keywords:
+            # Check if this keyword is manual (case-insensitive)
+            keyword_lower = keyword.lower()
+            is_manual = any(kw.lower() == keyword_lower for kw in self.manual_keywords)
+            
+            # Create keyword pill widget with manual indicator
+            keyword_pill = KeywordPillWidget(keyword, is_manual=is_manual)
+            keyword_pill.remove_button.clicked.connect(lambda checked, kw=keyword: self.remove_keyword(kw))
+            
+            # Get the preferred size of the pill
+            keyword_pill.adjustSize()
+            pill_width = keyword_pill.sizeHint().width()
+            
+            # Check if we need to wrap to a new row
+            # Account for margins and spacing
+            if current_row_width > 0 and (current_row_width + spacing + pill_width) > container_width:
+                # Start a new row
+                current_row += 1
+                current_row_width = 0
                 row_widget = QWidget()
                 row_layout = QHBoxLayout(row_widget)
                 row_layout.setContentsMargins(0, 0, 0, 0)
-                row_layout.setSpacing(2)
+                row_layout.setSpacing(spacing)
                 row_layouts.append(row_layout)
                 self.keywords_layout.addWidget(row_widget)
-                current_row += 1
-                
-            # Create the keyword label
-            keyword_label = QLabel(keyword)
-            keyword_label.setStyleSheet(f"""
-                background-color: {GuiConfig.COLOR_KEYWORD_BG}; 
-                color: {GuiConfig.COLOR_KEYWORD_TEXT};
-                padding: 1px 4px;
-                border-radius: 5px;
-                border: 1px solid {GuiConfig.COLOR_KEYWORD_BORDER};
-                margin: 2px;
-                font-size: {GuiConfig.FONT_SIZE_NORMAL}px;
-            """)
             
-            # Add the keyword to the current row
-            row_layouts[current_row].addWidget(keyword_label)
+            # Add the keyword pill to the current row
+            row_layouts[current_row].addWidget(keyword_pill)
+            current_row_width += pill_width + (spacing if current_row_width > 0 else 0)
         
         # Add stretch to each row to push keywords to the left
         for row_layout in row_layouts:
             row_layout.addStretch(1)
+    
+    def validate_input_realtime(self):
+        """Validate input field in real-time and update UI state"""
+        import re
+        text = self.keyword_input.text()
+        
+        # Check if input contains invalid characters (only check for invalid chars, not empty)
+        if text and not re.match(r'^[a-zA-Z0-9\s]+$', text):
+            # Invalid: show error state
+            self.keyword_input.setStyleSheet("border: 2px solid #ff4444; padding: 4px;")
+            self.error_label.show()
+            self.add_button.setEnabled(False)
+        else:
+            # Valid or empty: clear error state
+            self.keyword_input.setStyleSheet("border: 1px solid palette(mid); padding: 4px;")  # Explicit default style
+            self.error_label.hide()
+            # Enable button only if there's text (not empty)
+            self.add_button.setEnabled(bool(text.strip()))
+    
+    def validate_keyword(self, keyword):
+        """Validate keyword: only letters, numbers, and spaces allowed
+        
+        Args:
+            keyword: Keyword string to validate
+            
+        Returns:
+            tuple: (is_valid, error_message)
+        """
+        if not keyword or not keyword.strip():
+            return (False, "Keyword cannot be empty")
+        
+        # Trim whitespace
+        keyword = keyword.strip()
+        
+        # Check for special characters (allow only letters, numbers, and spaces)
+        import re
+        if not re.match(r'^[a-zA-Z0-9\s]+$', keyword):
+            return (False, "Keyword can only contain letters, numbers, and spaces")
+        
+        return (True, None)
+    
+    def add_keyword(self, keyword):
+        """Programmatically add a keyword to the list
+        
+        Args:
+            keyword: Keyword string to add
+        """
+        # Validate keyword
+        is_valid, error_msg = self.validate_keyword(keyword)
+        if not is_valid:
+            print(f"Invalid keyword: {error_msg}")
+            return False
+        
+        keyword = keyword.strip()
+        
+        # Check for duplicates (case-insensitive)
+        keyword_lower = keyword.lower()
+        if any(kw.lower() == keyword_lower for kw in self.keywords):
+            print(f"Keyword '{keyword}' already exists")
+            return False
+        
+        # Add keyword
+        self.keywords.append(keyword)
+        
+        # Mark as manual keyword (when added via UI)
+        self.manual_keywords.add(keyword)
+        
+        # Re-display keywords
+        self.set_keywords(self.keywords, manual_keywords=self.manual_keywords)
+        
+        # Emit signal to notify parent
+        self.keywords_changed.emit(self.keywords)
+        
+        return True
+    
+    def add_keyword_from_input(self):
+        """Add keyword from input field"""
+        keyword = self.keyword_input.text()
+        
+        # Check if button is enabled (input is valid)
+        if not self.add_button.isEnabled():
+            return
+        
+        if self.add_keyword(keyword):
+            # Clear input field on success and reset validation state
+            self.keyword_input.clear()
+            self.validate_input_realtime()  # Reset UI state
+    
+    def remove_keyword(self, keyword):
+        """Remove a keyword from the list
+        
+        Args:
+            keyword: Keyword string to remove
+        """
+        # Remove keyword (case-insensitive match)
+        keyword_lower = keyword.lower()
+        self.keywords = [kw for kw in self.keywords if kw.lower() != keyword_lower]
+        
+        # Remove from manual_keywords if present
+        self.manual_keywords = {kw for kw in self.manual_keywords if kw.lower() != keyword_lower}
+        
+        # Re-display keywords
+        self.set_keywords(self.keywords, manual_keywords=self.manual_keywords)
+        
+        # Emit signal to notify parent
+        self.keywords_changed.emit(self.keywords)
 
 class PauseHandler(QObject):
     pause_signal = pyqtSignal(bool)
@@ -1375,29 +1715,34 @@ class ImageIndexerGUI(QMainWindow):
         metadata_layout.addLayout(action_buttons_layout)
         
         # Caption
-        caption_group = QGroupBox("Caption")
-        caption_group.setStyleSheet("QGroupBox { border: none; }")
-        caption_layout = QVBoxLayout(caption_group)
+        caption_container = QWidget()  # Simple container instead of QGroupBox
+        caption_layout = QVBoxLayout(caption_container)
+        caption_layout.setContentsMargins(0, 0, 0, 0)  # No extra margins
+        caption_layout.setSpacing(4)  # Small spacing between label and edit
         
-        caption_layout.setContentsMargins(GuiConfig.CONTENT_MARGINS, GuiConfig.CONTENT_MARGINS, GuiConfig.CONTENT_MARGINS, GuiConfig.CONTENT_MARGINS)
-        caption_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        self.caption_label = QLabel("No caption generated yet")
-        self.caption_label.setWordWrap(True)
-        #self.caption_label.setFrameStyle(QFrame.Shape.NoFrame)
-        self.caption_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        self.caption_label.setStyleSheet(f"padding: 4px; font-weight: normal; border:none;")
+        # Label for "Caption" (store reference for indicator updates)
+        self.caption_label = QLabel("Caption")
+        self.caption_label.setStyleSheet("font-weight: bold;")
+        caption_layout.addWidget(self.caption_label)
         
-        # Create a scroll area for caption to ensure it fits in fixed space
-        caption_scroll = QScrollArea()
-        caption_scroll.setWidgetResizable(True)
-        caption_scroll.setWidget(self.caption_label)
-        caption_scroll.setFixedHeight(200)  # Ensure fixed height for caption area
-        caption_scroll.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        caption_layout.addWidget(caption_scroll, 0, Qt.AlignmentFlag.AlignTop)
-        metadata_layout.addWidget(caption_group, 0, Qt.AlignmentFlag.AlignTop)
+        # Editable caption field
+        self.caption_edit = QPlainTextEdit()
+        self.caption_edit.setPlaceholderText("No description. Write an image description here or click Regenerate to get started.")
+        self.caption_edit.setFixedHeight(200)  # Fixed height for caption area
+        self.caption_edit.setStyleSheet("padding: 4px; font-weight: normal; border: 1px solid palette(mid);")
+        # Explicit scrollbar control - only show when needed
+        self.caption_edit.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.caption_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # Connect textChanged signal to track manual edits
+        self.caption_edit.textChanged.connect(self.on_caption_edited)
+        caption_layout.addWidget(self.caption_edit)
+        
+        metadata_layout.addWidget(caption_container, 0, Qt.AlignmentFlag.AlignTop)
         
         # Keywords
-        self.keywords_widget = KeywordWidget()
+        self.keywords_widget = KeywordWidget(self)
+        # Connect signal to handle keyword changes
+        self.keywords_widget.keywords_changed.connect(self.on_keywords_changed)
         metadata_layout.addWidget(self.keywords_widget)
         
         # Set fixed size for metadata frame
@@ -1434,6 +1779,8 @@ class ImageIndexerGUI(QMainWindow):
         self.run_button.setEnabled(False)
         self.image_history = []  # [(base64_image, caption, keywords, filename, file_path, save_status, metadata_dict)]
         self.current_position = -1
+        self.manual_edits = {}  # {file_path: {'caption_edited': bool, 'keywords_manual': set}}
+        self._updating_caption = False  # Flag to prevent signal handler during programmatic updates
         
         if os.path.exists('settings.json'):
             try:
@@ -1477,7 +1824,7 @@ class ImageIndexerGUI(QMainWindow):
             if idx >= 0 and idx < len(self.image_history):
                 _, _, _, _, _, save_status, _ = self.image_history[idx]
                 self.update_action_buttons(save_status)
-    
+
     def show_settings(self):
         if self.settings_dialog.exec() == QDialog.DialogCode.Accepted:
             self.settings_dialog.save_settings()
@@ -1589,8 +1936,30 @@ class ImageIndexerGUI(QMainWindow):
         
         file_basename = os.path.basename(filename)
         
+        # Get file_path from current image history to check manual edits
+        file_path = None
+        if self.image_history:
+            if self.current_position == -1:
+                idx = len(self.image_history) - 1
+            else:
+                idx = self.current_position
+            if idx >= 0 and idx < len(self.image_history):
+                _, _, _, _, file_path, _, _ = self.image_history[idx]
+        
+        # Check if manually edited to show "Pending (Modified)" status
+        is_modified = False
+        if file_path and file_path in self.manual_edits:
+            is_modified = (
+                self.manual_edits[file_path].get('caption_edited', False) or
+                bool(self.manual_edits[file_path].get('keywords_manual', set()))
+            )
+        
         # Update filename label with save status (right-aligned)
-        status_text = save_status.capitalize()
+        if save_status == "pending" and is_modified:
+            status_text = "Pending (Modified)"
+        else:
+            status_text = save_status.capitalize()
+        
         status_color = {
             'pending': '#ff8c00',  # Orange
             'saved': '#4caf50',     # Green
@@ -1605,17 +1974,227 @@ class ImageIndexerGUI(QMainWindow):
         html_content = f'<table width="100%"><tr><td>{filename_text}</td><td align="right">{status_html}</td></tr></table>'
         self.filename_label.setText(html_content)
         
-        self.caption_label.setText(caption or "No caption generated")
-        self.keywords_widget.set_keywords(keywords or [])
+        # Set flag to prevent signal handler from firing during programmatic update
+        self._updating_caption = True
+        self.caption_edit.setPlainText(caption or "")
+        # Restore normal style (in case it was changed during regeneration)
+        self.caption_edit.setStyleSheet("padding: 4px; font-weight: normal; border: 1px solid palette(mid);")
+        self._updating_caption = False
+        
+        # Update caption label indicator based on manual edits
+        self.update_caption_edit_indicator()
+        
+        # Get manual keywords for this file (if any)
+        manual_keywords_set = set()
+        if file_path and file_path in self.manual_edits:
+            manual_keywords_lower = self.manual_edits[file_path].get('keywords_manual', set())
+            # Convert back to original case by matching with current keywords
+            if keywords:
+                for kw in keywords:
+                    if kw.lower() in manual_keywords_lower:
+                        manual_keywords_set.add(kw)
+        
+        # Update KeywordWidget with manual keywords tracking
+        self.keywords_widget.manual_keywords = manual_keywords_set.copy()
+        self.keywords_widget.set_keywords(keywords or [], manual_keywords=manual_keywords_set)
         self.update_navigation_buttons()
+        self.update_action_buttons(save_status)
+
+    def on_caption_edited(self):
+        """Handle manual caption edits"""
+        # Ignore if this is a programmatic update
+        if self._updating_caption:
+            return
+        
+        # Get current image data
+        if not self.image_history:
+            return
+        
+        # Determine current image index
+        if self.current_position == -1:
+            idx = len(self.image_history) - 1
+        else:
+            idx = self.current_position
+        
+        if idx < 0 or idx >= len(self.image_history):
+            return
+        
+        # Get current image data
+        base64_image, old_caption, keywords, filename, file_path, save_status, metadata = self.image_history[idx]
+        
+        # Get new caption from edit field
+        new_caption = self.caption_edit.toPlainText()
+        
+        # Mark as manually edited
+        if file_path not in self.manual_edits:
+            self.manual_edits[file_path] = {}
+        self.manual_edits[file_path]['caption_edited'] = True
+        
+        # Update image_history with new caption
+        new_save_status = "pending" if save_status == "saved" else save_status
+        self.image_history[idx] = (base64_image, new_caption, keywords, filename, file_path, new_save_status, metadata)
+        
+        # Update visual indicators and status
+        self.update_caption_edit_indicator()
+        self.update_action_buttons(new_save_status)
+        
+        # Update status display to show "Pending (Modified)" if applicable
+        # Only update the status label, not the full display (to avoid recursion)
+        if new_save_status == "pending":
+            file_basename = os.path.basename(filename)
+            status_text = "Pending (Modified)"
+            status_color = '#ff8c00'  # Orange
+            filename_text = f"Filename: {file_basename}"
+            status_html = f'<span style="color: {status_color}; font-weight: bold;">[{status_text}]</span>'
+            html_content = f'<table width="100%"><tr><td>{filename_text}</td><td align="right">{status_html}</td></tr></table>'
+            self.filename_label.setText(html_content)
+    
+    def update_caption_edit_indicator(self):
+        """Update visual indicators for manually edited caption"""
+        if not self.image_history:
+            # No images, clear indicator
+            self.caption_label.setText("Caption")
+            return
+        
+        # Determine current image index
+        if self.current_position == -1:
+            idx = len(self.image_history) - 1
+        else:
+            idx = self.current_position
+        
+        if idx < 0 or idx >= len(self.image_history):
+            return
+        
+        # Get current image file path
+        _, _, _, _, file_path, _, _ = self.image_history[idx]
+        
+        # Check if caption has been manually edited
+        is_edited = (file_path in self.manual_edits and 
+                    self.manual_edits[file_path].get('caption_edited', False))
+        
+        if is_edited:
+            # Show asterisk and orange border
+            self.caption_label.setText("Caption *")
+            self.caption_edit.setStyleSheet("padding: 4px; font-weight: normal; border: 2px solid #ff8c00;")
+        else:
+            # Normal state
+            self.caption_label.setText("Caption")
+            self.caption_edit.setStyleSheet("padding: 4px; font-weight: normal; border: 1px solid palette(mid);")
+
+    def on_keywords_changed(self, keywords):
+        """Handle keyword changes from KeywordWidget
+        
+        Args:
+            keywords: Updated list of keywords
+        """
+        # Get current image data
+        if not self.image_history:
+            return
+        
+        # Determine current image index
+        if self.current_position == -1:
+            idx = len(self.image_history) - 1
+        else:
+            idx = self.current_position
+        
+        if idx < 0 or idx >= len(self.image_history):
+            return
+        
+        # Get current image data
+        base64_image, caption, old_keywords, filename, file_path, save_status, metadata = self.image_history[idx]
+        
+        # Track manual keywords in manual_edits
+        if file_path not in self.manual_edits:
+            self.manual_edits[file_path] = {}
+        
+        # Update manual keywords set (case-insensitive)
+        manual_keywords_set = {kw.lower() for kw in self.keywords_widget.manual_keywords}
+        self.manual_edits[file_path]['keywords_manual'] = manual_keywords_set
+        
+        # Update image_history with new keywords
+        new_save_status = "pending" if save_status == "saved" else save_status
+        self.image_history[idx] = (base64_image, caption, keywords, filename, file_path, new_save_status, metadata)
+        
+        # Update status display if needed (only update status label, not full display to avoid recursion)
+        if new_save_status == "pending":
+            file_basename = os.path.basename(filename)
+            status_text = "Pending (Modified)"
+            status_color = '#ff8c00'  # Orange
+            filename_text = f"Filename: {file_basename}"
+            status_html = f'<span style="color: {status_color}; font-weight: bold;">[{status_text}]</span>'
+            html_content = f'<table width="100%"><tr><td>{filename_text}</td><td align="right">{status_html}</td></tr></table>'
+            self.filename_label.setText(html_content)
+            self.update_action_buttons(new_save_status)
+        else:
+            self.update_action_buttons(new_save_status)
+
+    def read_file_metadata_for_display(self, file_path, save_status):
+        """Read actual metadata from file and return for display
+        
+        Args:
+            file_path: Path to the image file
+            save_status: Current save status ("saved", "pending", etc.)
+            
+        Returns:
+            tuple: (caption, keywords, metadata_dict) or None if file doesn't exist or status is not "saved"
+        """
+        try:
+            # Only read from file if status is "saved" (file has been written)
+            if save_status != "saved":
+                return None
+            
+            # Create a minimal config for RegenerationHelper
+            config = llmii.Config()
+            config.use_sidecar = self.settings_dialog.use_sidecar_checkbox.isChecked()
+            
+            helper = RegenerationHelper(config)
+            try:
+                file_metadata = helper.read_metadata(file_path)
+                if file_metadata:
+                    # Try MWG fields first, fall back to Composite fields
+                    caption = file_metadata.get("MWG:Description") or file_metadata.get("Composite:Description", "")
+                    keywords = file_metadata.get("MWG:Keywords") or file_metadata.get("Composite:Keywords", [])
+                    # Ensure keywords is a list
+                    if isinstance(keywords, str):
+                        keywords = [keywords]
+                    elif keywords is None:
+                        keywords = []
+                    return (caption, keywords, file_metadata)
+            finally:
+                helper.cleanup()
+        except Exception as e:
+            print(f"Error reading file metadata: {e}")
+            return None
+    
+    def _update_navigation_with_file_metadata(self, idx):
+        """Helper to update navigation with file metadata if saved
+        
+        Args:
+            idx: Index in image_history to update and display
+        """
+        if idx < 0 or idx >= len(self.image_history):
+            return
+        
+        base64_image, caption, keywords, filename, file_path, save_status, metadata = self.image_history[idx]
+        
+        # Read file metadata if saved, merge with history
+        file_data = self.read_file_metadata_for_display(file_path, save_status)
+        if file_data:
+            file_caption, file_keywords, file_metadata = file_data
+            # Use file data (fresh from disk)
+            caption = file_caption
+            keywords = file_keywords
+            metadata = file_metadata
+            # Update history with fresh file data
+            self.image_history[idx] = (base64_image, caption, keywords, filename, file_path, save_status, metadata)
+        
+        self.display_image(base64_image, caption, keywords, filename, save_status)
         self.update_action_buttons(save_status)
 
     def navigate_first(self):
         if self.image_history:
             self.current_position = 0
-            base64_image, caption, keywords, filename, file_path, save_status, metadata = self.image_history[0]
-            self.display_image(base64_image, caption, keywords, filename, save_status)
-            self.update_action_buttons(save_status)
+            self._update_navigation_with_file_metadata(0)
 
     def navigate_prev(self):
         if not self.image_history:
@@ -1625,14 +2204,10 @@ class ImageIndexerGUI(QMainWindow):
             # If at the most recent, go to the second most recent
             if len(self.image_history) > 1:
                 self.current_position = len(self.image_history) - 2
-                base64_image, caption, keywords, filename, file_path, save_status, metadata = self.image_history[self.current_position]
-                self.display_image(base64_image, caption, keywords, filename, save_status)
-                self.update_action_buttons(save_status)
+                self._update_navigation_with_file_metadata(self.current_position)
         elif self.current_position > 0:
             self.current_position -= 1
-            base64_image, caption, keywords, filename, file_path, save_status, metadata = self.image_history[self.current_position]
-            self.display_image(base64_image, caption, keywords, filename, save_status)
-            self.update_action_buttons(save_status)
+            self._update_navigation_with_file_metadata(self.current_position)
 
     def navigate_next(self):
         if not self.image_history:
@@ -1645,18 +2220,13 @@ class ImageIndexerGUI(QMainWindow):
             if self.current_position == len(self.image_history) - 1:
                 self.current_position = -1
                 
-            base64_image, caption, keywords, filename, file_path, save_status, metadata = self.image_history[
-                len(self.image_history) - 1 if self.current_position == -1 else self.current_position
-            ]
-            self.display_image(base64_image, caption, keywords, filename, save_status)
-            self.update_action_buttons(save_status)
+            idx = len(self.image_history) - 1 if self.current_position == -1 else self.current_position
+            self._update_navigation_with_file_metadata(idx)
 
     def navigate_last(self):
         if self.image_history:
             self.current_position = -1
-            base64_image, caption, keywords, filename, file_path, save_status, metadata = self.image_history[-1]
-            self.display_image(base64_image, caption, keywords, filename, save_status)
-            self.update_action_buttons(save_status)
+            self._update_navigation_with_file_metadata(len(self.image_history) - 1)
 
     def update_action_buttons(self, save_status="pending"):
         """Update action button states based on save_status
@@ -1769,6 +2339,11 @@ class ImageIndexerGUI(QMainWindow):
                 # Update status in history with prepared metadata
                 self.image_history[idx] = (base64_image, caption, keywords, filename, file_path, "saved", prepared_metadata)
                 
+                # Clear manual edit flags after successful save
+                if file_path in self.manual_edits:
+                    self.manual_edits[file_path]['caption_edited'] = False
+                    self.manual_edits[file_path]['keywords_manual'] = set()
+                
                 # Refresh display
                 self.display_image(base64_image, caption, keywords, filename, "saved")
                 self.update_action_buttons("saved")
@@ -1847,6 +2422,26 @@ class ImageIndexerGUI(QMainWindow):
         # Check generation mode to determine if we're regenerating keywords
         generation_mode = 'description_only' if self.settings_dialog.description_only_radio.isChecked() else ('keywords_only' if self.settings_dialog.keywords_only_radio.isChecked() else 'both')
         
+        # Check if caption has been manually edited and will be overwritten
+        caption_will_be_regenerated = generation_mode in ['description_only', 'both']
+        caption_is_edited = (file_path in self.manual_edits and 
+                           self.manual_edits[file_path].get('caption_edited', False))
+        
+        if caption_will_be_regenerated and caption_is_edited:
+            # Show confirmation dialog
+            reply = QMessageBox.warning(
+                self,
+                "Overwrite Manual Edits?",
+                "This will overwrite and replace the content in the description including any manual edits you've made. Any manually added keywords will be safe. Are you sure you want to continue?",
+                QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Ok,
+                QMessageBox.StandardButton.Cancel
+            )
+            
+            if reply != QMessageBox.StandardButton.Ok:
+                # User cancelled, re-enable buttons and return
+                self.update_action_buttons(save_status)
+                return
+        
         # Show "Generating" status
         file_basename = os.path.basename(filename)
         status_text = "Generating"
@@ -1858,15 +2453,23 @@ class ImageIndexerGUI(QMainWindow):
         
         if generation_mode == "keywords_only":
             # Only regenerating keywords - preserve description, show generating message for keywords
-            self.caption_label.setText(caption or "No caption generated")  # Preserve existing description
+            self._updating_caption = True
+            self.caption_edit.setPlainText(caption or "")  # Preserve existing description
+            self._updating_caption = False
             self.keywords_widget.show_generating_message()  # Show "Regenerating Keywords..." message
         elif generation_mode == "description_only":
             # Only regenerating description - preserve keywords, show generating message for description
-            self.caption_label.setText('<span style="color: #2196F3; font-style: italic;">Regenerating Description...</span>')  # Show generating message with styling
+            self._updating_caption = True
+            self.caption_edit.setPlainText("Regenerating Description...")  # Show generating message
+            self.caption_edit.setStyleSheet("padding: 4px; font-weight: normal; border: 1px solid palette(mid); color: #2196F3; font-style: italic;")
+            self._updating_caption = False
             # Don't update keywords - leave them as they are (no clear, no set_keywords call)
         else:  # generation_mode == "both"
             # Regenerating both - show generating messages for both
-            self.caption_label.setText('<span style="color: #2196F3; font-style: italic;">Regenerating Description...</span>')  # Show generating message with styling
+            self._updating_caption = True
+            self.caption_edit.setPlainText("Regenerating Description...")  # Show generating message
+            self.caption_edit.setStyleSheet("padding: 4px; font-weight: normal; border: 1px solid palette(mid); color: #2196F3; font-style: italic;")
+            self._updating_caption = False
             self.keywords_widget.show_generating_message()  # Show "Regenerating Keywords..." message
         
         self.update_action_buttons("generating")
@@ -1911,9 +2514,19 @@ class ImageIndexerGUI(QMainWindow):
         self.regenerate_idx = idx
         self.regenerate_original_data = (base64_image, caption, keywords, filename, save_status)
         
+        # Get manual keywords for this file (if any)
+        manual_keywords = set()
+        if file_path and file_path in self.manual_edits:
+            manual_keywords_lower = self.manual_edits[file_path].get('keywords_manual', set())
+            # Convert back to original case by matching with current keywords
+            if keywords:
+                for kw in keywords:
+                    if kw.lower() in manual_keywords_lower:
+                        manual_keywords.add(kw)
+        
         # Create and start regeneration thread
         self.regenerate_thread = RegenerateThread(
-            config, base64_image, caption, keywords, filename, file_path, save_status, metadata
+            config, base64_image, caption, keywords, filename, file_path, save_status, metadata, manual_keywords
         )
         self.regenerate_thread.regeneration_complete.connect(self.on_regeneration_complete)
         self.regenerate_thread.regeneration_error.connect(self.on_regeneration_error)
@@ -1925,6 +2538,23 @@ class ImageIndexerGUI(QMainWindow):
         # Update history entry
         idx = self.regenerate_idx
         self.image_history[idx] = (base64_image, new_caption, new_keywords, filename, file_path, new_save_status, new_metadata)
+        
+        # Determine generation mode to check if description was regenerated
+        generation_mode = 'description_only' if self.settings_dialog.description_only_radio.isChecked() else ('keywords_only' if self.settings_dialog.keywords_only_radio.isChecked() else 'both')
+        
+        # Clear manual edit flag if description was regenerated
+        if generation_mode in ['description_only', 'both']:
+            if file_path in self.manual_edits:
+                self.manual_edits[file_path]['caption_edited'] = False
+        
+        # Preserve manual keywords tracking after regeneration
+        # Manual keywords are preserved in the merged keywords list
+        if file_path in self.manual_edits and self.manual_edits[file_path].get('keywords_manual'):
+            # Update manual keywords set to match what's actually in the new keywords
+            manual_keywords_lower = self.manual_edits[file_path].get('keywords_manual', set())
+            # Keep only keywords that are still present in new_keywords
+            preserved_manual = {kw.lower() for kw in new_keywords if kw.lower() in manual_keywords_lower}
+            self.manual_edits[file_path]['keywords_manual'] = preserved_manual
         
         # Check if auto-save is enabled - if so, automatically save
         if self.auto_save_button.isChecked():
@@ -2020,7 +2650,7 @@ class ImageIndexerGUI(QMainWindow):
             delattr(self, 'regenerate_idx')
         if hasattr(self, 'regenerate_original_data'):
             delattr(self, 'regenerate_original_data')
-    
+
     def update_navigation_buttons(self):
         history_size = len(self.image_history)
         
@@ -2068,7 +2698,8 @@ class ImageIndexerGUI(QMainWindow):
         
         self.image_preview.setText("No image processed yet")
         self.filename_label.setText("Filename: ")
-        self.caption_label.setText("No caption generated yet")
+        self.caption_edit.setPlainText("")
+        self.caption_edit.setStyleSheet("padding: 4px; font-weight: normal; border: 1px solid palette(mid);")
         self.keywords_widget.clear()
         
         # Get directory from main window
@@ -2210,7 +2841,7 @@ class ImageIndexerGUI(QMainWindow):
                     unsaved_count += 1
         
         return unsaved_count > 0, unsaved_count
-    
+        
     def closeEvent(self, event):
         # Check for unsaved changes
         has_unsaved, unsaved_count = self.has_unsaved_changes()
@@ -2351,6 +2982,10 @@ def run_gui():
             background-color: #e0e0e0;
             color: #888888;
             border: 1px solid #c0c0c0;
+        }
+        QToolTip {
+            max-width: 250px;
+            word-wrap: break-word;
         }
     """
     app.setStyleSheet(global_button_style)
