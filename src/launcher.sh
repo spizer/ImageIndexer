@@ -85,6 +85,9 @@ run_gui() {
     chmod +x "$SCRIPT_DIR/gui.sh"
     
     bash "$SCRIPT_DIR/gui.sh"
+    
+    # Clear screen after GUI returns to show clean menu
+    clear
 }
 
 run_setup() {

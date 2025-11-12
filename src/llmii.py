@@ -512,10 +512,12 @@ class LLMProcessor:
             if self.api_password:
                 headers["Authorization"] = f"Bearer {self.api_password}"
             
+            # Add timeout to prevent hanging (120 seconds should be enough for most LLM responses)
             response = self.requests.post(
                 endpoint,
                 json=payload,
-                headers=headers
+                headers=headers,
+                timeout=120
             )
             
             response.raise_for_status()

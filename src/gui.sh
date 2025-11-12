@@ -26,6 +26,14 @@ source "$VENV_NAME/bin/activate"
 
 python3 -m src.llmii_gui
 
+# Clear screen after GUI exits to remove any LLM server output
+# Add delay to allow any pending output to appear, then clear
+sleep 1
+clear
+# Clear again after a brief moment to catch any late output
+sleep 0.2
+clear
+
 echo "Done."
 
 deactivate

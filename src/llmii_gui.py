@@ -1169,31 +1169,7 @@ class ImageIndexerGUI(QMainWindow):
         self.ignore_button = QPushButton("Ignore")
         self.ignore_button.setEnabled(False)  # Disabled initially
         
-        # Explicitly set button style to match default QPushButton appearance
-        # This ensures they look like the Settings button regardless of parent widget styles
-        button_style = """
-            QPushButton {
-                background-color: palette(button);
-                border: 1px solid palette(mid);
-                border-radius: 3px;
-                padding: 4px 12px;
-                min-width: 60px;
-            }
-            QPushButton:hover {
-                background-color: palette(light);
-            }
-            QPushButton:pressed {
-                background-color: palette(dark);
-            }
-            QPushButton:disabled {
-                background-color: #e0e0e0;
-                color: #888888;
-                border: 1px solid #c0c0c0;
-            }
-        """
-        self.save_button.setStyleSheet(button_style)
-        self.regenerate_button.setStyleSheet(button_style)
-        self.ignore_button.setStyleSheet(button_style)
+        # Button styles are now applied globally in run_gui(), so all buttons have consistent styling
         
         action_buttons_layout.addWidget(self.save_button)
         action_buttons_layout.addWidget(self.regenerate_button)
@@ -1454,7 +1430,23 @@ class ImageIndexerGUI(QMainWindow):
             self.update_action_buttons(save_status)
 
     def update_action_buttons(self, save_status="pending"):
-        """Update action button states based on save_status"""
+        """Update action button states based on save_status
+        
+        Args:
+            save_status: One of "pending", "saved", "ignored", "generating", or "" (empty for no images)
+        """
+        # Special case: "generating" status - disable all buttons during regeneration
+        if save_status == "generating":
+            self.save_button.setEnabled(False)
+            self.regenerate_button.setEnabled(False)
+            self.ignore_button.setEnabled(False)
+            # Force visual update
+            self.save_button.update()
+            self.regenerate_button.update()
+            self.ignore_button.update()
+            QApplication.processEvents()
+            return
+        
         # If empty status (no images), disable all buttons
         if not save_status:
             self.save_button.setEnabled(False)
@@ -1470,8 +1462,8 @@ class ImageIndexerGUI(QMainWindow):
         # Save: only enabled when status is "pending"
         self.save_button.setEnabled(save_status == "pending")
         
-        # Regenerate: enabled when status is "pending" or "saved" (not when generating)
-        self.regenerate_button.setEnabled(save_status in ["pending", "saved"] and save_status != "generating")
+        # Regenerate: enabled when status is "pending" or "saved"
+        self.regenerate_button.setEnabled(save_status in ["pending", "saved"])
         
         # Ignore: only enabled when status is "pending"
         self.ignore_button.setEnabled(save_status == "pending")
@@ -1695,22 +1687,42 @@ class ImageIndexerGUI(QMainWindow):
         print(error_msg)
         
         # Restore original display on error
-        base64_image, caption, keywords, filename, save_status = self.regenerate_original_data
-        self.display_image(base64_image, caption, keywords, filename, save_status)
+        if hasattr(self, 'regenerate_original_data'):
+            base64_image, caption, keywords, filename, save_status = self.regenerate_original_data
+            self.display_image(base64_image, caption, keywords, filename, save_status)
+            # Restore button states based on original status
+            self.update_action_buttons(save_status)
     
     def on_regeneration_finished(self):
         """Handle thread completion - re-enable buttons"""
-        # Re-enable buttons based on current status
+        # Check if user is still viewing the regenerated image
         if hasattr(self, 'regenerate_idx') and self.regenerate_idx < len(self.image_history):
-            _, _, _, _, _, save_status, _ = self.image_history[self.regenerate_idx]
-            self.update_action_buttons(save_status)
+            # Determine the current position (handle -1 for "most recent")
+            current_idx = self.current_position if self.current_position >= 0 else (len(self.image_history) - 1 if self.image_history else -1)
+            
+            # Only update buttons if user is still viewing the regenerated image
+            if current_idx == self.regenerate_idx:
+                _, _, _, _, _, save_status, _ = self.image_history[self.regenerate_idx]
+                self.update_action_buttons(save_status)
+            # If user navigated away, buttons will be updated when they navigate back
         else:
-            # Fallback: enable buttons if we can't determine status
-            self.update_action_buttons("")
+            # Fallback: update buttons based on currently viewed image
+            if self.image_history and self.current_position >= 0:
+                _, _, _, _, _, save_status, _ = self.image_history[self.current_position]
+                self.update_action_buttons(save_status)
+            elif self.image_history and self.current_position == -1:
+                _, _, _, _, _, save_status, _ = self.image_history[-1]
+                self.update_action_buttons(save_status)
+            else:
+                self.update_action_buttons("")
         
-        # Clean up thread reference
+        # Clean up thread reference and index
         if hasattr(self, 'regenerate_thread'):
             self.regenerate_thread = None
+        if hasattr(self, 'regenerate_idx'):
+            delattr(self, 'regenerate_idx')
+        if hasattr(self, 'regenerate_original_data'):
+            delattr(self, 'regenerate_original_data')
     
     def update_navigation_buttons(self):
         history_size = len(self.image_history)
@@ -1886,16 +1898,130 @@ class ImageIndexerGUI(QMainWindow):
         """We override this but it shouldn't be called since window is fixed"""
         super().resizeEvent(event)
         
+    def has_unsaved_changes(self):
+        """Check if there are any unsaved changes in image_history"""
+        if not hasattr(self, 'image_history') or not self.image_history:
+            return False, 0
+        
+        unsaved_count = 0
+        for entry in self.image_history:
+            # Entry format: (base64_image, caption, keywords, filename, file_path, save_status, metadata)
+            if len(entry) >= 6:
+                save_status = entry[5]  # save_status is at index 5
+                if save_status == "pending":
+                    unsaved_count += 1
+        
+        return unsaved_count > 0, unsaved_count
+    
     def closeEvent(self, event):
+        # Check for unsaved changes
+        has_unsaved, unsaved_count = self.has_unsaved_changes()
+        
+        if has_unsaved:
+            # Show confirmation dialog
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Icon.Warning)
+            msg.setWindowTitle("Unsaved Changes")
+            msg.setText(f"You have {unsaved_count} unsaved change{'s' if unsaved_count > 1 else ''}.")
+            msg.setInformativeText("Are you sure you want to exit without saving?")
+            
+            # Add buttons: Cancel (left) and Exit without saving (right)
+            cancel_button = msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            exit_button = msg.addButton("Exit without saving", QMessageBox.ButtonRole.AcceptRole)
+            
+            # Set Cancel as default (highlighted)
+            msg.setDefaultButton(cancel_button)
+            
+            # Show dialog and get result
+            result = msg.exec()
+            
+            # If user clicked Cancel, ignore the close event
+            if msg.clickedButton() == cancel_button:
+                event.ignore()
+                return
+        
+        # Check if threads are running (API calls in progress)
+        indexer_running = hasattr(self, 'indexer_thread') and self.indexer_thread and self.indexer_thread.isRunning()
+        regenerate_running = hasattr(self, 'regenerate_thread') and self.regenerate_thread and self.regenerate_thread.isRunning()
+        
+        if indexer_running or regenerate_running:
+            # Show waiting dialog (non-dismissible modal, frameless)
+            waiting_dialog = QDialog(self)
+            waiting_dialog.setModal(True)
+            # Frameless window - no title bar or close button
+            waiting_dialog.setWindowFlags(
+                Qt.WindowType.Dialog | 
+                Qt.WindowType.FramelessWindowHint | 
+                Qt.WindowType.WindowStaysOnTopHint
+            )
+            
+            # Create layout with message and progress bar
+            layout = QVBoxLayout(waiting_dialog)
+            layout.setSpacing(15)
+            layout.setContentsMargins(30, 30, 30, 30)
+            
+            # Add message label
+            message_label = QLabel("The window will close once the current progress is complete.")
+            message_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            message_label.setWordWrap(True)
+            layout.addWidget(message_label)
+            
+            # Add indeterminate progress bar (spinner)
+            progress_bar = QProgressBar()
+            progress_bar.setRange(0, 0)  # Indeterminate
+            progress_bar.setMinimumWidth(300)
+            layout.addWidget(progress_bar)
+            
+            # Override closeEvent to prevent dismissal
+            def non_dismissible_close(event):
+                event.ignore()  # Ignore close attempts
+            waiting_dialog.closeEvent = non_dismissible_close
+            waiting_dialog.reject = lambda: None  # Prevent reject (escape key)
+            
+            # Center the dialog on the main window
+            waiting_dialog.adjustSize()
+            main_window_geometry = self.geometry()
+            dialog_x = main_window_geometry.x() + (main_window_geometry.width() - waiting_dialog.width()) // 2
+            dialog_y = main_window_geometry.y() + (main_window_geometry.height() - waiting_dialog.height()) // 2
+            waiting_dialog.move(dialog_x, dialog_y)
+            
+            waiting_dialog.show()
+            QApplication.processEvents()  # Ensure dialog is visible
+            
+            # Signal threads to stop
+            if indexer_running:
+                self.indexer_thread.stopped = True
+            if regenerate_running:
+                # RegenerateThread doesn't have a stopped flag, so we'll just wait for it
+                pass
+            
+            # Wait for threads to finish (with 150 second timeout to allow for API processing)
+            # Process events periodically to keep dialog responsive
+            timeout_ms = 150000  # 150 seconds
+            elapsed = 0
+            check_interval = 100  # Check every 100ms
+            
+            while elapsed < timeout_ms:
+                # Check if threads are still running
+                indexer_still_running = indexer_running and self.indexer_thread.isRunning()
+                regenerate_still_running = regenerate_running and self.regenerate_thread.isRunning()
+                
+                if not indexer_still_running and not regenerate_still_running:
+                    # Both threads finished
+                    break
+                
+                # Wait a bit and process events to keep UI responsive
+                QThread.msleep(check_interval)
+                QApplication.processEvents()
+                elapsed += check_interval
+            
+            # Close the waiting dialog
+            waiting_dialog.close()
+        
         # Clean up API check thread when closing the window
         if self.api_check_thread and self.api_check_thread.isRunning():
             self.api_check_thread.stop()
             self.api_check_thread.wait()
-        
-        # Clean up regeneration thread if running
-        if hasattr(self, 'regenerate_thread') and self.regenerate_thread and self.regenerate_thread.isRunning():
-            self.regenerate_thread.terminate()
-            self.regenerate_thread.wait()
         
         event.accept()
 
@@ -1906,6 +2032,30 @@ def run_gui():
         app = QApplication(sys.argv)
     
     app.setStyle("Fusion")  # Modern cross-platform style
+    
+    # Apply global button stylesheet for consistent disabled state across all buttons
+    # This ensures navigation buttons and all other buttons have consistent styling
+    global_button_style = """
+        QPushButton {
+            background-color: palette(button);
+            border: 1px solid palette(mid);
+            border-radius: 3px;
+            padding: 4px 12px;
+            min-width: 60px;
+        }
+        QPushButton:hover {
+            background-color: palette(light);
+        }
+        QPushButton:pressed {
+            background-color: palette(dark);
+        }
+        QPushButton:disabled {
+            background-color: #e0e0e0;
+            color: #888888;
+            border: 1px solid #c0c0c0;
+        }
+    """
+    app.setStyleSheet(global_button_style)
 
     
     palette = QPalette()
