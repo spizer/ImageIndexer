@@ -26,8 +26,14 @@ try:
     from . import help_text
 except ImportError:
     # Running as main script (e.g., in py2app bundle)
-    import sys
-    import os
+    pass
+
+if not hasattr(sys, 'frozen'):
+    # Running as main script (not in py2app bundle)
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sys.path.insert(0, project_root)
+    import src.llmii as llmii
+    import src.help_text as help_text
     
     if hasattr(sys, 'frozen'):
         # Running from py2app bundle
@@ -708,13 +714,23 @@ class RegenerationHelper:
             if self.config.use_sidecar and os.path.exists(file_path + ".xmp"):
                 file_path = file_path + ".xmp"
             
-            # Read metadata - include both MWG and Composite fields as fallback
-            exiftool_fields = [
-                "SourceFile", 
-                "MWG:Keywords", "MWG:Description",
-                "Composite:Keywords", "Composite:Description",  # Fallback fields
-                "XMP:Identifier", "XMP:Status"
+            # Read metadata - request all keyword and caption fields (matching main collection logic)
+            # This ensures we read metadata regardless of which field ExifTool returns it in
+            keyword_fields = [
+                "Keywords", "IPTC:Keywords", "Composite:keywords", "Subject",
+                "DC:Subject", "XMP:Subject", "XMP-dc:Subject", "MWG:Keywords"
             ]
+            caption_fields = [
+                "Description", "XMP:Description", "ImageDescription", "DC:Description",
+                "EXIF:ImageDescription", "Composite:Description", "Caption", "IPTC:Caption",
+                "Composite:Caption", "IPTC:Caption-Abstract", "XMP-dc:Description",
+                "PNG:Description", "MWG:Description"
+            ]
+            exiftool_fields = (
+                ["SourceFile", "XMP:Identifier", "XMP:Status"] +
+                keyword_fields +
+                caption_fields
+            )
             
             result = self.et.get_tags([file_path], tags=exiftool_fields)
             if result and len(result) > 0:
@@ -725,29 +741,42 @@ class RegenerationHelper:
             return {}
     
     def process_keywords(self, metadata, new_keywords):
-        """Normalize extracted keywords and deduplicate them (same as FileProcessor)"""
+        """Normalize extracted keywords and deduplicate them (same as FileProcessor)
+        Uses case-insensitive deduplication to prevent duplicates.
+        """
         from src.llmii import normalize_keyword
         
-        all_keywords = set()
+        all_keywords = {}  # Use dict to preserve original case while deduplicating case-insensitively
         
         if self.config.update_keywords:
             existing_keywords = metadata.get("MWG:Keywords", [])
             
             if isinstance(existing_keywords, str):
                 existing_keywords = existing_keywords.split(",")
+                # Strip whitespace from each keyword
+                existing_keywords = [kw.strip() for kw in existing_keywords if kw.strip()]
             
             for keyword in existing_keywords:
+                if not keyword:
+                    continue
                 normalized = normalize_keyword(keyword, self.banned_words, self.config)
                 if normalized:
-                    all_keywords.add(normalized)
+                    # Use lowercase as key for case-insensitive deduplication
+                    # Store the normalized version (preserves original case from normalization)
+                    all_keywords[normalized.lower()] = normalized
         
         for keyword in new_keywords:
+            if not keyword:
+                continue
             normalized = normalize_keyword(keyword, self.banned_words, self.config)
             if normalized:
-                all_keywords.add(normalized)
+                # Use lowercase as key for case-insensitive deduplication
+                # Only add if not already present (case-insensitive check)
+                if normalized.lower() not in all_keywords:
+                    all_keywords[normalized.lower()] = normalized
         
         if all_keywords:
-            return list(all_keywords)
+            return list(all_keywords.values())
         else:
             return []
     
@@ -787,7 +816,11 @@ class RegenerationHelper:
                     status = "retry"
                 else:
                     status = "success"
-                    keywords = self.process_keywords(metadata, keywords)
+                    # For regeneration, don't merge existing keywords - only process new ones
+                    # Create metadata copy without existing keywords to prevent duplication
+                    metadata_without_keywords = metadata.copy()
+                    metadata_without_keywords.pop("MWG:Keywords", None)
+                    keywords = self.process_keywords(metadata_without_keywords, keywords)
                     
             else:  # generation_mode == "both"
                 if not self.config.no_caption and self.config.detailed_caption:
@@ -883,6 +916,9 @@ class RegenerationHelper:
         prepared["XMP:Status"] = "success"
         
         # Ensure keywords is always a list, not None
+        # DEBUG: Log keywords in metadata before preparation
+        print(f"DEBUG PREPARE: Keywords in metadata: {prepared.get('MWG:Keywords', 'NOT FOUND')}")
+        
         if "MWG:Keywords" not in prepared or prepared["MWG:Keywords"] is None:
             prepared["MWG:Keywords"] = []
         elif not isinstance(prepared["MWG:Keywords"], list):
@@ -985,14 +1021,17 @@ class RegenerateThread(QThread):
                     else:
                         # Ensure SourceFile is set correctly
                         current_metadata["SourceFile"] = self.file_path
-                        # Merge with history metadata to preserve any unsaved changes
-                        for key in ["MWG:Keywords", "MWG:Description"]:
-                            if key in self.metadata and key not in current_metadata:
-                                current_metadata[key] = self.metadata[key]
+                        # Update description from current caption (may have manual edits from UI)
+                        current_metadata["MWG:Description"] = self.caption
+                        # Merge with history metadata to preserve any unsaved changes (except description which we just set)
+                        if "MWG:Keywords" in self.metadata and "MWG:Keywords" not in current_metadata:
+                            current_metadata["MWG:Keywords"] = self.metadata["MWG:Keywords"]
                 else:
                     # Status is "pending" - use metadata from history (has unsaved changes)
                     current_metadata = self.metadata.copy()
                     current_metadata["SourceFile"] = self.file_path
+                    # Update description from current caption (may have manual edits from UI)
+                    current_metadata["MWG:Description"] = self.caption
                 
                 # Generate new metadata using existing processed_image (base64)
                 new_metadata = helper.generate_metadata(current_metadata, self.base64_image)
@@ -1299,9 +1338,9 @@ class KeywordWidget(QWidget):
             item = self.keywords_layout.takeAt(0)
             if item:
                 widget = item.widget()
-                if widget:
-                    widget.setParent(None)
-                    widget.deleteLater()
+            if widget:
+                widget.setParent(None)
+                widget.deleteLater()
         self.keywords = []
         # Force immediate update to ensure widgets are removed
         QApplication.processEvents()
@@ -1342,6 +1381,10 @@ class KeywordWidget(QWidget):
             keywords: List of keyword strings
             manual_keywords: Set of manually added keywords (for green styling)
         """
+        # DEBUG: Log when set_keywords is called - Option 4
+        print(f"DEBUG SET_KEYWORDS: Setting {len(keywords) if keywords else 0} keywords: {keywords}")
+        print(f"DEBUG SET_KEYWORDS: Manual keywords: {manual_keywords}")
+        
         self.clear()
         self.keywords = keywords
         
@@ -1699,18 +1742,44 @@ class ImageIndexerGUI(QMainWindow):
         self.regenerate_button.setEnabled(False)  # Disabled initially
         self.ignore_button = QPushButton("Ignore")
         self.ignore_button.setEnabled(False)  # Disabled initially
+        self.clear_button = QPushButton("Clear metadata")
+        self.clear_button.setEnabled(False)  # Disabled initially (no image selected)
+        # Style clear button as red/destructive
+        self.clear_button.setStyleSheet("""
+            QPushButton {
+                background-color: #dc3545;
+                color: white;
+                border: 1px solid #dc3545;
+                padding: 5px 15px;
+                border-radius: 3px;
+            }
+            QPushButton:hover {
+                background-color: #c82333;
+                border-color: #bd2130;
+            }
+            QPushButton:pressed {
+                background-color: #bd2130;
+            }
+            QPushButton:disabled {
+                background-color: #e0e0e0;
+                color: #888888;
+                border: 1px solid #c0c0c0;
+            }
+        """)
         
         # Button styles are now applied globally in run_gui(), so all buttons have consistent styling
         
         action_buttons_layout.addWidget(self.save_button)
         action_buttons_layout.addWidget(self.regenerate_button)
         action_buttons_layout.addWidget(self.ignore_button)
+        action_buttons_layout.addWidget(self.clear_button)
         action_buttons_layout.addStretch()  # Push buttons to the left
         
         # Connect button signals
         self.save_button.clicked.connect(self.save_current_image)
         self.regenerate_button.clicked.connect(self.regenerate_current_image)
         self.ignore_button.clicked.connect(self.ignore_current_image)
+        self.clear_button.clicked.connect(self.clear_current_image_metadata)
         
         metadata_layout.addLayout(action_buttons_layout)
         
@@ -2151,15 +2220,60 @@ class ImageIndexerGUI(QMainWindow):
             try:
                 file_metadata = helper.read_metadata(file_path)
                 if file_metadata:
-                    # Try MWG fields first, fall back to Composite fields
-                    caption = file_metadata.get("MWG:Description") or file_metadata.get("Composite:Description", "")
-                    keywords = file_metadata.get("MWG:Keywords") or file_metadata.get("Composite:Keywords", [])
+                    # Collect keywords and caption from all fields (matching main collection logic)
+                    # This ensures we read metadata regardless of which field ExifTool returns it in
+                    keyword_fields = [
+                        "Keywords", "IPTC:Keywords", "Composite:keywords", "Subject",
+                        "DC:Subject", "XMP:Subject", "XMP-dc:Subject", "MWG:Keywords"
+                    ]
+                    caption_fields = [
+                        "Description", "XMP:Description", "ImageDescription", "DC:Description",
+                        "EXIF:ImageDescription", "Composite:Description", "Caption", "IPTC:Caption",
+                        "Composite:Caption", "IPTC:Caption-Abstract", "XMP-dc:Description",
+                        "PNG:Description", "MWG:Description"
+                    ]
+                    
+                    collected_keywords = []
+                    caption = None
+                    
+                    for key, value in file_metadata.items():
+                        # Collect from all keyword fields (matching main collection logic)
+                        if key in keyword_fields:
+                            if isinstance(value, list):
+                                collected_keywords.extend(value)
+                            elif isinstance(value, str):
+                                collected_keywords.append(value)
+                        # Collect from all caption fields (matching main collection logic)
+                        elif key in caption_fields:
+                            caption = value
+                    
+                    keywords = collected_keywords
+                    
+                    # DEBUG: Log keywords read from file
+                    print(f"DEBUG READ: Collected keywords: {keywords}")
+                    
                     # Ensure keywords is a list
                     if isinstance(keywords, str):
                         keywords = [keywords]
                     elif keywords is None:
                         keywords = []
-                    return (caption, keywords, file_metadata)
+                    
+                    # Deduplicate keywords (case-insensitive) - matching main collection logic
+                    if keywords:
+                        seen = {}
+                        deduplicated = []
+                        for kw in keywords:
+                            if kw:  # Skip empty strings
+                                kw_lower = kw.lower().strip()
+                                if kw_lower and kw_lower not in seen:
+                                    seen[kw_lower] = kw
+                                    deduplicated.append(kw)
+                        keywords = deduplicated
+                    
+                    # DEBUG: Log final keywords after deduplication
+                    print(f"DEBUG READ: Final keywords (after deduplication): {keywords}")
+                    
+                    return (caption or "", keywords, file_metadata)
             finally:
                 helper.cleanup()
         except Exception as e:
@@ -2184,8 +2298,12 @@ class ImageIndexerGUI(QMainWindow):
             # Use file data (fresh from disk)
             caption = file_caption
             keywords = file_keywords
+            # Standardize metadata dict to use MWG fields (not raw ExifTool fields)
+            # This ensures generate_metadata and prepare_metadata_for_save work correctly
+            file_metadata["MWG:Keywords"] = keywords
+            file_metadata["MWG:Description"] = caption
             metadata = file_metadata
-            # Update history with fresh file data
+            # Update history with fresh file data (standardized)
             self.image_history[idx] = (base64_image, caption, keywords, filename, file_path, save_status, metadata)
         
         self.display_image(base64_image, caption, keywords, filename, save_status)
@@ -2239,10 +2357,12 @@ class ImageIndexerGUI(QMainWindow):
             self.save_button.setEnabled(False)
             self.regenerate_button.setEnabled(False)
             self.ignore_button.setEnabled(False)
+            self.clear_button.setEnabled(False)
             # Force visual update
             self.save_button.update()
             self.regenerate_button.update()
             self.ignore_button.update()
+            self.clear_button.update()
             QApplication.processEvents()
             return
         
@@ -2251,10 +2371,12 @@ class ImageIndexerGUI(QMainWindow):
             self.save_button.setEnabled(False)
             self.regenerate_button.setEnabled(False)
             self.ignore_button.setEnabled(False)
+            self.clear_button.setEnabled(False)
             # Force visual update
             self.save_button.update()
             self.regenerate_button.update()
             self.ignore_button.update()
+            self.clear_button.update()
             QApplication.processEvents()
             return
         
@@ -2270,10 +2392,14 @@ class ImageIndexerGUI(QMainWindow):
         # Ignore: only enabled when status is "pending"
         self.ignore_button.setEnabled(save_status == "pending")
         
+        # Clear: enabled when any image is displayed (not when no image selected)
+        self.clear_button.setEnabled(save_status != "" and save_status is not None)
+        
         # Force visual update
         self.save_button.update()
         self.regenerate_button.update()
         self.ignore_button.update()
+        self.clear_button.update()
         QApplication.processEvents()
     
     def save_current_image(self):
@@ -2289,12 +2415,27 @@ class ImageIndexerGUI(QMainWindow):
             idx = self.current_position
         
         # Get the current image data from history
-        base64_image, caption, keywords, filename, file_path, save_status, metadata = self.image_history[idx]
+        base64_image, old_caption, old_keywords, filename, file_path, save_status, metadata = self.image_history[idx]
         
         # Only save if status is "pending"
         if save_status != "pending":
             self.update_output(f"Image {os.path.basename(filename)} is already saved or ignored.")
             return
+        
+        # Read current values from UI widgets (source of truth for manual edits)
+        current_caption = self.caption_edit.toPlainText()
+        current_keywords = self.keywords_widget.keywords.copy() if self.keywords_widget.keywords else []
+        
+        # DEBUG: Log keywords read from UI
+        print(f"DEBUG SAVE: Reading from UI - keywords: {current_keywords}")
+        print(f"DEBUG SAVE: Metadata before prepare - MWG:Keywords: {metadata.get('MWG:Keywords', 'NOT FOUND')}")
+        
+        # Ensure keywords is a list (not None)
+        if current_keywords is None:
+            current_keywords = []
+        
+        # Update image_history with current UI values (keep in sync)
+        self.image_history[idx] = (base64_image, current_caption, current_keywords, filename, file_path, save_status, metadata)
         
         # Create minimal config for helper (only needed for initialization)
         config = llmii.Config()
@@ -2314,6 +2455,13 @@ class ImageIndexerGUI(QMainWindow):
             # Prepare metadata for saving (ensures status="success", keywords is list, etc.)
             prepared_metadata = helper.prepare_metadata_for_save(metadata)
             
+            # Update prepared_metadata with current UI values (manual edits)
+            prepared_metadata["MWG:Description"] = current_caption
+            prepared_metadata["MWG:Keywords"] = current_keywords
+            
+            # DEBUG: Log final keywords to write
+            print(f"DEBUG SAVE: Final keywords to write: {prepared_metadata['MWG:Keywords']}")
+            
             # Ensure SourceFile is set correctly
             prepared_metadata["SourceFile"] = file_path
             
@@ -2321,8 +2469,8 @@ class ImageIndexerGUI(QMainWindow):
                 self.update_output(f"Dry run: Would save metadata to {os.path.basename(filename)}")
                 # Update status to "saved" even in dry run for UI consistency
                 # Use prepared metadata so status is "success"
-                self.image_history[idx] = (base64_image, caption, keywords, filename, file_path, "saved", prepared_metadata)
-                self.display_image(base64_image, caption, keywords, filename, "saved")
+                self.image_history[idx] = (base64_image, current_caption, current_keywords, filename, file_path, "saved", prepared_metadata)
+                self.display_image(base64_image, current_caption, current_keywords, filename, "saved")
                 self.update_action_buttons("saved")
                 return
             
@@ -2336,8 +2484,8 @@ class ImageIndexerGUI(QMainWindow):
             )
             
             if success:
-                # Update status in history with prepared metadata
-                self.image_history[idx] = (base64_image, caption, keywords, filename, file_path, "saved", prepared_metadata)
+                # Update status in history with prepared metadata (using current UI values)
+                self.image_history[idx] = (base64_image, current_caption, current_keywords, filename, file_path, "saved", prepared_metadata)
                 
                 # Clear manual edit flags after successful save
                 if file_path in self.manual_edits:
@@ -2345,7 +2493,7 @@ class ImageIndexerGUI(QMainWindow):
                     self.manual_edits[file_path]['keywords_manual'] = set()
                 
                 # Refresh display
-                self.display_image(base64_image, caption, keywords, filename, "saved")
+                self.display_image(base64_image, current_caption, current_keywords, filename, "saved")
                 self.update_action_buttons("saved")
                 
                 # Log success
@@ -2393,6 +2541,115 @@ class ImageIndexerGUI(QMainWindow):
         # Log action
         self.update_output(f"Ignored {os.path.basename(filename)}")
     
+    def clear_current_image_metadata(self):
+        """Clear all Description and Keywords from the current image"""
+        if not self.image_history:
+            self.update_output("Error: No image selected to clear.")
+            return
+        
+        # Get current image index
+        if self.current_position < 0:
+            # If at most recent, use the last item
+            if self.current_position == -1 and self.image_history:
+                idx = len(self.image_history) - 1
+            else:
+                self.update_output("Error: No image selected to clear.")
+                return
+        else:
+            idx = self.current_position
+        
+        # Get the current image data from history
+        base64_image, caption, keywords, filename, file_path, save_status, metadata = self.image_history[idx]
+        
+        # Show confirmation dialog
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setWindowTitle("Clear Metadata")
+        msg.setText("Continuing will erase the Description and all Keywords (tags).")
+        msg.setInformativeText("This cannot be undone. Are you sure you want to continue?")
+        
+        # Add buttons: Cancel (left) and Continue (right)
+        cancel_button = msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        continue_button = msg.addButton("Continue", QMessageBox.ButtonRole.AcceptRole)
+        
+        # Set Cancel as default (highlighted)
+        msg.setDefaultButton(cancel_button)
+        
+        # Show dialog and get result
+        msg.exec()
+        
+        if msg.clickedButton() == cancel_button:
+            # User cancelled
+            return
+        
+        # User confirmed - proceed with clearing metadata
+        try:
+            # Create minimal config for helper
+            config = llmii.Config()
+            config.use_sidecar = self.settings_dialog.use_sidecar_checkbox.isChecked()
+            config.no_backup = self.settings_dialog.no_backup_checkbox.isChecked()
+            config.dry_run = self.settings_dialog.dry_run_checkbox.isChecked()
+            
+            helper = RegenerationHelper(config)
+            
+            # Adjust file path for sidecar if needed
+            write_path = file_path
+            if config.use_sidecar:
+                write_path = file_path + ".xmp"
+            
+            if config.dry_run:
+                self.update_output(f"Dry run: Would clear metadata from {os.path.basename(filename)}")
+                # Update UI even in dry run
+                empty_caption = ""
+                empty_keywords = []
+                updated_metadata = metadata.copy()
+                updated_metadata["MWG:Description"] = ""
+                updated_metadata["MWG:Keywords"] = []
+                self.image_history[idx] = (base64_image, empty_caption, empty_keywords, filename, file_path, "saved", updated_metadata)
+                self.display_image(base64_image, empty_caption, empty_keywords, filename, "saved")
+                self.update_action_buttons("saved")
+                helper.cleanup()
+                return
+            
+            # Use ExifTool's execute method with deletion syntax (confirmed working)
+            # Command: exiftool -MWG:Keywords= -MWG:Description= -overwrite_original -P file.jpg
+            params = ["-MWG:Keywords=", "-MWG:Description="]
+            
+            if config.no_backup or config.use_sidecar:
+                params.append("-overwrite_original")
+            
+            params.append("-P")
+            params.append(write_path)
+            
+            # Execute the deletion command
+            helper.et.execute(*params)
+            
+            # Update image history with cleared values
+            empty_caption = ""
+            empty_keywords = []
+            updated_metadata = metadata.copy()
+            updated_metadata["MWG:Description"] = ""
+            updated_metadata["MWG:Keywords"] = []
+            updated_metadata["XMP:Status"] = "success"  # Mark as successfully cleared
+            
+            self.image_history[idx] = (base64_image, empty_caption, empty_keywords, filename, file_path, "saved", updated_metadata)
+            
+            # Refresh display
+            self.display_image(base64_image, empty_caption, empty_keywords, filename, "saved")
+            self.update_action_buttons("saved")
+            
+            # Clear manual edits tracking
+            if file_path in self.manual_edits:
+                self.manual_edits[file_path] = {'caption_edited': False, 'keywords_manual': set()}
+            
+            self.update_output(f"Successfully cleared metadata from {os.path.basename(filename)}")
+            
+            helper.cleanup()
+            
+        except Exception as e:
+            self.update_output(f"Error clearing metadata from {os.path.basename(filename)}: {str(e)}")
+            print(f"Error clearing metadata: {e}")
+    
     def regenerate_current_image(self):
         """Regenerate metadata for the current image"""
         if not self.image_history or self.current_position < 0:
@@ -2406,7 +2663,10 @@ class ImageIndexerGUI(QMainWindow):
             idx = self.current_position
         
         # Get the current image data from history
-        base64_image, caption, keywords, filename, file_path, save_status, metadata = self.image_history[idx]
+        base64_image, old_caption, keywords, filename, file_path, save_status, metadata = self.image_history[idx]
+        
+        # Read current caption from UI (source of truth for manual edits)
+        current_caption = self.caption_edit.toPlainText()
         
         # Only regenerate if status is "pending" or "saved"
         if save_status not in ["pending", "saved"]:
@@ -2417,6 +2677,7 @@ class ImageIndexerGUI(QMainWindow):
         self.save_button.setEnabled(False)
         self.regenerate_button.setEnabled(False)
         self.ignore_button.setEnabled(False)
+        self.clear_button.setEnabled(False)
         QApplication.processEvents()
         
         # Check generation mode to determine if we're regenerating keywords
@@ -2454,7 +2715,7 @@ class ImageIndexerGUI(QMainWindow):
         if generation_mode == "keywords_only":
             # Only regenerating keywords - preserve description, show generating message for keywords
             self._updating_caption = True
-            self.caption_edit.setPlainText(caption or "")  # Preserve existing description
+            self.caption_edit.setPlainText(current_caption or "")  # Preserve current description from UI
             self._updating_caption = False
             self.keywords_widget.show_generating_message()  # Show "Regenerating Keywords..." message
         elif generation_mode == "description_only":
@@ -2512,7 +2773,7 @@ class ImageIndexerGUI(QMainWindow):
         
         # Store the index for updating history when regeneration completes
         self.regenerate_idx = idx
-        self.regenerate_original_data = (base64_image, caption, keywords, filename, save_status)
+        self.regenerate_original_data = (base64_image, current_caption, keywords, filename, save_status)
         
         # Get manual keywords for this file (if any)
         manual_keywords = set()
@@ -2525,8 +2786,9 @@ class ImageIndexerGUI(QMainWindow):
                         manual_keywords.add(kw)
         
         # Create and start regeneration thread
+        # Use current_caption from UI instead of caption from history
         self.regenerate_thread = RegenerateThread(
-            config, base64_image, caption, keywords, filename, file_path, save_status, metadata, manual_keywords
+            config, base64_image, current_caption, keywords, filename, file_path, save_status, metadata, manual_keywords
         )
         self.regenerate_thread.regeneration_complete.connect(self.on_regeneration_complete)
         self.regenerate_thread.regeneration_error.connect(self.on_regeneration_error)
@@ -2985,7 +3247,6 @@ def run_gui():
         }
         QToolTip {
             max-width: 250px;
-            word-wrap: break-word;
         }
     """
     app.setStyleSheet(global_button_style)
