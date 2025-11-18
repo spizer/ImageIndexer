@@ -664,7 +664,8 @@ class FileProcessor:
             "Subject",
             "DC:Subject",
             "XMP:Subject",
-            "XMP-dc:Subject"
+            "XMP-dc:Subject",
+            "MWG:Keywords"
         ]
         self.caption_fields = [
             "Description",
@@ -675,10 +676,11 @@ class FileProcessor:
             "Composite:Description",
             "Caption",
             "IPTC:Caption",
-            "Composite:Caption"
+            "Composite:Caption",
             "IPTC:Caption-Abstract",
             "XMP-dc:Description",
-            "PNG:Description"
+            "PNG:Description",
+            "MWG:Description"
         ]
 
         self.identifier_fields = [
@@ -785,6 +787,8 @@ class FileProcessor:
                                       
                                 new_metadata["SourceFile"] = metadata.get("SourceFile")
                                 
+                                # Collect keywords and caption from all fields (original working behavior)
+                                # This ensures we read metadata regardless of which field ExifTool returns it in
                                 for key, value in metadata.items():
                                     if key in self.keyword_fields:
                                         keywords.extend(value)
@@ -794,6 +798,18 @@ class FileProcessor:
                                         identifier = value
                                     if key in self.status_fields:
                                         status = value
+                                
+                                # Deduplicate keywords immediately after collection to prevent duplicates from multiple fields
+                                if keywords:
+                                    seen = {}
+                                    deduplicated = []
+                                    for kw in keywords:
+                                        if kw:  # Skip empty strings
+                                            kw_lower = kw.lower().strip()
+                                            if kw_lower and kw_lower not in seen:
+                                                seen[kw_lower] = kw
+                                                deduplicated.append(kw)
+                                    keywords = deduplicated
                                         
                                 # Standardize the fields                             
                                 if keywords:
@@ -1236,8 +1252,30 @@ class FileProcessor:
                 params.append("-overwrite_original")
             if self.config.use_sidecar:
                 file_path = file_path + ".xmp"
-                
+            
+            # First pass: Delete existing keywords using ExifTool's deletion syntax
+            # This prevents keyword duplication by clearing before writing
+            # Always delete keywords before writing (even if empty list) to ensure clean state
+            delete_params = ["-MWG:Keywords="]
+            
+            if self.config.no_backup or self.config.use_sidecar:
+                delete_params.append("-overwrite_original")
+            
+            delete_params.append("-P")
+            delete_params.append(file_path)
+            
+            # Execute the deletion command
+            try:
+                print(f"DEBUG WRITE: Deleting existing keywords with params: {delete_params}")
+                self.et.execute(*delete_params)
+                print(f"DEBUG WRITE: Keyword deletion completed")
+            except Exception as delete_error:
+                print(f"DEBUG WRITE: Warning - keyword deletion failed: {delete_error}")
+                # Continue anyway - the write might still work
+            
+            # Second pass: Write all metadata (including new keywords) using set_tags
             # Use existing ExifTool instance
+            print(f"DEBUG WRITE: Writing metadata with keywords: {metadata.get('MWG:Keywords', 'NOT FOUND')}")
             self.et.set_tags(file_path, tags=metadata, params=params)
             
             return True
@@ -1251,29 +1289,41 @@ class FileProcessor:
     def process_keywords(self, metadata, new_keywords):
         """ Normalize extracted keywords and deduplicate them.
             If update is configured, combine the old and new keywords.
+            Uses case-insensitive deduplication to prevent duplicates.
         """
-        all_keywords = set()
+        all_keywords = {}  # Use dict to preserve original case while deduplicating case-insensitively
               
         if self.config.update_keywords:
             existing_keywords = metadata.get("MWG:Keywords", [])
             
             if isinstance(existing_keywords, str):
-                existing_keywords = existing_keywords.split(",").strip()
+                existing_keywords = existing_keywords.split(",")
+                # Strip whitespace from each keyword
+                existing_keywords = [kw.strip() for kw in existing_keywords if kw.strip()]
                 
             for keyword in existing_keywords:
+                if not keyword:
+                    continue
                 normalized = normalize_keyword(keyword, self.banned_words, self.config)
             
                 if normalized:
-                    all_keywords.add(normalized)
+                    # Use lowercase as key for case-insensitive deduplication
+                    # Store the normalized version (preserves original case from normalization)
+                    all_keywords[normalized.lower()] = normalized
                            
         for keyword in new_keywords:
+            if not keyword:
+                continue
             normalized = normalize_keyword(keyword, self.banned_words, self.config)
             
             if normalized:
-                all_keywords.add(normalized)
+                # Use lowercase as key for case-insensitive deduplication
+                # Only add if not already present (case-insensitive check)
+                if normalized.lower() not in all_keywords:
+                    all_keywords[normalized.lower()] = normalized
 
         if all_keywords:        
-            return list(all_keywords)
+            return list(all_keywords.values())
         else:
             return []
         

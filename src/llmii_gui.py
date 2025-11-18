@@ -969,7 +969,29 @@ class RegenerationHelper:
             if use_sidecar:
                 write_path = file_path + ".xmp"
             
+            # First pass: Delete existing keywords using ExifTool's deletion syntax
+            # This prevents keyword duplication by clearing before writing
+            # Always delete keywords before writing (even if empty list) to ensure clean state
+            delete_params = ["-MWG:Keywords="]
+            
+            if no_backup or use_sidecar:
+                delete_params.append("-overwrite_original")
+            
+            delete_params.append("-P")
+            delete_params.append(write_path)
+            
+            # Execute the deletion command
+            try:
+                print(f"DEBUG WRITE: Deleting existing keywords with params: {delete_params}")
+                self.et.execute(*delete_params)
+                print(f"DEBUG WRITE: Keyword deletion completed")
+            except Exception as delete_error:
+                print(f"DEBUG WRITE: Warning - keyword deletion failed: {delete_error}")
+                # Continue anyway - the write might still work
+            
+            # Second pass: Write all metadata (including new keywords) using set_tags
             # Use existing ExifTool instance
+            print(f"DEBUG WRITE: Writing metadata with keywords: {metadata.get('MWG:Keywords', 'NOT FOUND')}")
             self.et.set_tags(write_path, tags=metadata, params=params)
             
             return True
