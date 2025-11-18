@@ -252,7 +252,7 @@ class Config:
         self.no_crawl = False
         self.no_backup = False
         self.dry_run = False
-        self.update_keywords = False
+        # Removed self.update_keywords - feature removed
         self.reprocess_failed = False
         self.reprocess_all = False
         self.reprocess_orphans = True
@@ -1253,29 +1253,65 @@ class FileProcessor:
             if self.config.use_sidecar:
                 file_path = file_path + ".xmp"
             
-            # First pass: Delete existing keywords using ExifTool's deletion syntax
-            # This prevents keyword duplication by clearing before writing
-            # Always delete keywords before writing (even if empty list) to ensure clean state
-            delete_params = ["-MWG:Keywords="]
-            
-            if self.config.no_backup or self.config.use_sidecar:
-                delete_params.append("-overwrite_original")
-            
-            delete_params.append("-P")
-            delete_params.append(file_path)
-            
-            # Execute the deletion command
+            # FIRST PASS: Use a SEPARATE ExifTool instance for deletion
+            # This prevents any state/cache issues from interfering with deletion
+            # The deletion instance is created, used, and terminated before writing
+            delete_et = None
             try:
-                print(f"DEBUG WRITE: Deleting existing keywords with params: {delete_params}")
-                self.et.execute(*delete_params)
-                print(f"DEBUG WRITE: Keyword deletion completed")
+                # Create a fresh ExifTool instance specifically for deletion
+                delete_et = exiftool.ExifToolHelper(encoding='utf-8')
+                
+                # Delete ALL keyword and description fields comprehensively
+                # Use comprehensive list of all possible fields to ensure complete deletion
+                delete_params = [
+                    "-Keywords=",
+                    "-IPTC:Keywords=",
+                    "-XMP:Subject=",
+                    "-XMP-dc:Subject=",
+                    "-DC:Subject=",
+                    "-Subject=",
+                    "-Composite:Keywords=",
+                    "-MWG:Keywords=",
+                    "-Description=",
+                    "-XMP:Description=",
+                    "-XMP-dc:Description=",
+                    "-DC:Description=",
+                    "-ImageDescription=",
+                    "-EXIF:ImageDescription=",
+                    "-Composite:Description=",
+                    "-Caption=",
+                    "-IPTC:Caption=",
+                    "-IPTC:Caption-Abstract=",
+                    "-MWG:Description="
+                ]
+                
+                if self.config.no_backup or self.config.use_sidecar:
+                    delete_params.append("-overwrite_original")
+                
+                delete_params.append("-P")
+                delete_params.append(file_path)
+                
+                # Execute deletion with separate instance
+                print(f"DEBUG WRITE: Deleting with separate ExifTool instance, params: {delete_params}")
+                delete_et.execute(*delete_params)
+                print(f"DEBUG WRITE: Deletion completed with separate instance")
+                
             except Exception as delete_error:
-                print(f"DEBUG WRITE: Warning - keyword deletion failed: {delete_error}")
+                print(f"DEBUG WRITE: Warning - deletion failed: {delete_error}")
                 # Continue anyway - the write might still work
+            finally:
+                # CRITICAL: Terminate the deletion instance before proceeding
+                # This ensures no state is carried over to the main instance
+                if delete_et is not None:
+                    try:
+                        delete_et.terminate()
+                        print(f"DEBUG WRITE: Deletion instance terminated")
+                    except Exception as term_error:
+                        print(f"DEBUG WRITE: Warning - termination error: {term_error}")
             
-            # Second pass: Write all metadata (including new keywords) using set_tags
-            # Use existing ExifTool instance
-            print(f"DEBUG WRITE: Writing metadata with keywords: {metadata.get('MWG:Keywords', 'NOT FOUND')}")
+            # SECOND PASS: Use the main instance for writing
+            # The deletion instance is now terminated, so this is a clean write
+            print(f"DEBUG WRITE: Writing metadata with main instance, keywords: {metadata.get('MWG:Keywords', 'NOT FOUND')}")
             self.et.set_tags(file_path, tags=metadata, params=params)
             
             return True
@@ -1288,29 +1324,12 @@ class FileProcessor:
     
     def process_keywords(self, metadata, new_keywords):
         """ Normalize extracted keywords and deduplicate them.
-            If update is configured, combine the old and new keywords.
+            Returns only the new keywords (no merging with existing).
             Uses case-insensitive deduplication to prevent duplicates.
         """
         all_keywords = {}  # Use dict to preserve original case while deduplicating case-insensitively
               
-        if self.config.update_keywords:
-            existing_keywords = metadata.get("MWG:Keywords", [])
-            
-            if isinstance(existing_keywords, str):
-                existing_keywords = existing_keywords.split(",")
-                # Strip whitespace from each keyword
-                existing_keywords = [kw.strip() for kw in existing_keywords if kw.strip()]
-                
-            for keyword in existing_keywords:
-                if not keyword:
-                    continue
-                normalized = normalize_keyword(keyword, self.banned_words, self.config)
-            
-                if normalized:
-                    # Use lowercase as key for case-insensitive deduplication
-                    # Store the normalized version (preserves original case from normalization)
-                    all_keywords[normalized.lower()] = normalized
-                           
+        # Process only new keywords (no merging with existing)
         for keyword in new_keywords:
             if not keyword:
                 continue

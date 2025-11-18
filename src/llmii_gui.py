@@ -430,12 +430,10 @@ class SettingsDialog(QDialog):
         xmp_group = QGroupBox("Existing Metadata")
         xmp_layout = QVBoxLayout()
         
-        self.update_keywords_checkbox = QCheckBox("Don't clear existing keywords (new will be added)")
-        self.update_keywords_checkbox.setChecked(True)
+        # Removed update_keywords_checkbox - feature no longer needed
         self.update_caption_checkbox = QCheckBox("Don't clear existing caption (new will be added surrounded by tags)")
         self.update_caption_checkbox.setChecked(False)
         
-        xmp_layout.addWidget(self.update_keywords_checkbox)
         xmp_layout.addWidget(self.update_caption_checkbox)
         
         xmp_group.setLayout(xmp_layout)
@@ -596,7 +594,7 @@ class SettingsDialog(QDialog):
                 # Update visibility based on selected mode
                 self.update_both_options_visibility(self.both_radio.isChecked())
                     
-                self.update_keywords_checkbox.setChecked(settings.get('update_keywords', True))
+                # Removed update_keywords - feature removed
                 self.update_caption_checkbox.setChecked(settings.get('update_caption', False))
                 
                 # Load keyword correction settings
@@ -637,7 +635,7 @@ class SettingsDialog(QDialog):
             'dry_run': self.dry_run_checkbox.isChecked(),
             'skip_verify': self.skip_verify_checkbox.isChecked(),
             'quick_fail': self.quick_fail_checkbox.isChecked(),
-            'update_keywords': self.update_keywords_checkbox.isChecked(),
+            # Removed update_keywords - feature removed
             'update_caption': self.update_caption_checkbox.isChecked(),
             'generation_mode': 'description_only' if self.description_only_radio.isChecked() else ('keywords_only' if self.keywords_only_radio.isChecked() else 'both'),
             'both_query_method': 'separate' if self.separate_query_radio.isChecked() else 'combined',
@@ -741,30 +739,15 @@ class RegenerationHelper:
             return {}
     
     def process_keywords(self, metadata, new_keywords):
-        """Normalize extracted keywords and deduplicate them (same as FileProcessor)
+        """Normalize extracted keywords and deduplicate them.
+        Returns only the new keywords (no merging with existing).
         Uses case-insensitive deduplication to prevent duplicates.
         """
         from src.llmii import normalize_keyword
         
         all_keywords = {}  # Use dict to preserve original case while deduplicating case-insensitively
         
-        if self.config.update_keywords:
-            existing_keywords = metadata.get("MWG:Keywords", [])
-            
-            if isinstance(existing_keywords, str):
-                existing_keywords = existing_keywords.split(",")
-                # Strip whitespace from each keyword
-                existing_keywords = [kw.strip() for kw in existing_keywords if kw.strip()]
-            
-            for keyword in existing_keywords:
-                if not keyword:
-                    continue
-                normalized = normalize_keyword(keyword, self.banned_words, self.config)
-                if normalized:
-                    # Use lowercase as key for case-insensitive deduplication
-                    # Store the normalized version (preserves original case from normalization)
-                    all_keywords[normalized.lower()] = normalized
-        
+        # Process only new keywords (no merging with existing)
         for keyword in new_keywords:
             if not keyword:
                 continue
@@ -969,29 +952,65 @@ class RegenerationHelper:
             if use_sidecar:
                 write_path = file_path + ".xmp"
             
-            # First pass: Delete existing keywords using ExifTool's deletion syntax
-            # This prevents keyword duplication by clearing before writing
-            # Always delete keywords before writing (even if empty list) to ensure clean state
-            delete_params = ["-MWG:Keywords="]
-            
-            if no_backup or use_sidecar:
-                delete_params.append("-overwrite_original")
-            
-            delete_params.append("-P")
-            delete_params.append(write_path)
-            
-            # Execute the deletion command
+            # FIRST PASS: Use a SEPARATE ExifTool instance for deletion
+            # This prevents any state/cache issues from interfering with deletion
+            # The deletion instance is created, used, and terminated before writing
+            delete_et = None
             try:
-                print(f"DEBUG WRITE: Deleting existing keywords with params: {delete_params}")
-                self.et.execute(*delete_params)
-                print(f"DEBUG WRITE: Keyword deletion completed")
+                # Create a fresh ExifTool instance specifically for deletion
+                delete_et = exiftool.ExifToolHelper(encoding='utf-8')
+                
+                # Delete ALL keyword and description fields comprehensively
+                # Use comprehensive list of all possible fields to ensure complete deletion
+                delete_params = [
+                    "-Keywords=",
+                    "-IPTC:Keywords=",
+                    "-XMP:Subject=",
+                    "-XMP-dc:Subject=",
+                    "-DC:Subject=",
+                    "-Subject=",
+                    "-Composite:Keywords=",
+                    "-MWG:Keywords=",
+                    "-Description=",
+                    "-XMP:Description=",
+                    "-XMP-dc:Description=",
+                    "-DC:Description=",
+                    "-ImageDescription=",
+                    "-EXIF:ImageDescription=",
+                    "-Composite:Description=",
+                    "-Caption=",
+                    "-IPTC:Caption=",
+                    "-IPTC:Caption-Abstract=",
+                    "-MWG:Description="
+                ]
+                
+                if no_backup or use_sidecar:
+                    delete_params.append("-overwrite_original")
+                
+                delete_params.append("-P")
+                delete_params.append(write_path)
+                
+                # Execute deletion with separate instance
+                print(f"DEBUG WRITE: Deleting with separate ExifTool instance, params: {delete_params}")
+                delete_et.execute(*delete_params)
+                print(f"DEBUG WRITE: Deletion completed with separate instance")
+                
             except Exception as delete_error:
-                print(f"DEBUG WRITE: Warning - keyword deletion failed: {delete_error}")
+                print(f"DEBUG WRITE: Warning - deletion failed: {delete_error}")
                 # Continue anyway - the write might still work
+            finally:
+                # CRITICAL: Terminate the deletion instance before proceeding
+                # This ensures no state is carried over to the main instance
+                if delete_et is not None:
+                    try:
+                        delete_et.terminate()
+                        print(f"DEBUG WRITE: Deletion instance terminated")
+                    except Exception as term_error:
+                        print(f"DEBUG WRITE: Warning - termination error: {term_error}")
             
-            # Second pass: Write all metadata (including new keywords) using set_tags
-            # Use existing ExifTool instance
-            print(f"DEBUG WRITE: Writing metadata with keywords: {metadata.get('MWG:Keywords', 'NOT FOUND')}")
+            # SECOND PASS: Use the main instance for writing
+            # The deletion instance is now terminated, so this is a clean write
+            print(f"DEBUG WRITE: Writing metadata with main instance, keywords: {metadata.get('MWG:Keywords', 'NOT FOUND')}")
             self.et.set_tags(write_path, tags=metadata, params=params)
             
             return True
@@ -2773,7 +2792,7 @@ class ImageIndexerGUI(QMainWindow):
         config.instruction = self.settings_dialog.general_instruction_input.toPlainText()
         config.caption_instruction = self.settings_dialog.description_instruction_input.toPlainText()
         config.keyword_instruction = self.settings_dialog.keyword_instruction_input.toPlainText()
-        config.update_keywords = self.settings_dialog.update_keywords_checkbox.isChecked()
+        # Removed config.update_keywords - feature removed
         config.update_caption = self.settings_dialog.update_caption_checkbox.isChecked()
         config.detailed_caption = self.settings_dialog.separate_query_radio.isChecked() if config.generation_mode == "both" else False
         config.short_caption = not config.detailed_caption if config.generation_mode == "both" else True
@@ -3041,7 +3060,7 @@ class ImageIndexerGUI(QMainWindow):
         config.instruction = self.settings_dialog.general_instruction_input.toPlainText()
         config.keyword_instruction = self.settings_dialog.keyword_instruction_input.toPlainText()
         
-        config.update_keywords = self.settings_dialog.update_keywords_checkbox.isChecked()
+        # Removed config.update_keywords - feature removed
         config.update_caption = self.settings_dialog.update_caption_checkbox.isChecked()
         # Use auto-save button state (which is synced with settings dialog)
         config.auto_save = self.auto_save_button.isChecked()
