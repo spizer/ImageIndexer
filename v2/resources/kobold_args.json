@@ -1,0 +1,9 @@
+{
+    "executable": "koboldcpp-1_101_1",
+    "model_param": "https://huggingface.co/bartowski/Qwen_Qwen2.5-VL-7B-Instruct-GGUF/blob/main/Qwen_Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf",
+    "mmproj": "https://huggingface.co/bartowski/Qwen_Qwen2.5-VL-7B-Instruct-GGUF/blob/main/mmproj-Qwen_Qwen2.5-VL-7B-Instruct-f16.gguf",
+    "flashattention": true,
+    "contextsize": "4096",
+    "visionmaxres": "9999",
+    "chatcompletionsadapter": "chatml"
+}
