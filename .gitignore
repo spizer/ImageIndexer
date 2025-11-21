@@ -12,3 +12,8 @@ resources/koboldcpp-*
 # Phase 9: macOS .app Bundle Setup - Build artifacts
 /build/
 /dist/
+
+# macOS system files
+.DS_Store
+**/.DS_Store
+*.DS_Store
