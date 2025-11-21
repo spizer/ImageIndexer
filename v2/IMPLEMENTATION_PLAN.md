@@ -119,15 +119,6 @@ This document outlines the phased implementation plan for refactoring and updati
   - Fast downloads (10MB test files)
   - Configurable delays
   - Error simulation support
-- **Usage**:
-  ```python
-  # Enable debugging
-  LLMSelectionModal.DEBUG_MODE = True
-  LLMSelectionModal.DEBUG_VERBOSE = True  # Optional: extra detail
-  LLMSelectionModal.USE_MOCK_DOWNLOADS = True  # For testing
-  
-  modal = LLMSelectionModal(config)
-  ```
 
 ---
 
